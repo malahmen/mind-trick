@@ -60,12 +60,13 @@ _report() {
     local n; n=$(_matching_commits | wc -l | tr -d ' ')
     if [[ "$n" -eq 0 ]]; then success "No commits match /$PATTERN/ — nothing to do."; return 1; fi
     warn "${n} commit(s) contain a line matching /$PATTERN/:"
-    _git log --all -i -E --grep="$PATTERN" --format='  %h %an | %s' | head -20 >&2
+    _git log --all -n 20 -i -E --grep="$PATTERN" --format='  %h %an | %s' >&2   # -n, not | head: no SIGPIPE under pipefail
+    (( n > 20 )) && info "  … and $((n - 20)) more"
     info "Affected branches:"
     local b
     while IFS= read -r b; do
         [[ -z "$b" ]] && continue
-        [[ -n "$(_git log "$b" -i -E --grep="$PATTERN" --format='%H' | head -1)" ]] && printf '    %s\n' "$b" >&2
+        [[ -n "$(_git log "$b" -n 1 -i -E --grep="$PATTERN" --format='%H')" ]] && printf '    %s\n' "$b" >&2
     done < <(_git for-each-ref --format='%(refname:short)' refs/heads)
     return 0
 }
