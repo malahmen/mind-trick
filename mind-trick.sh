@@ -32,6 +32,7 @@ PATTERN='^Co-Authored-By: Claude'   # grep -iE, matched per message line
 APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
+ORIGIN_REFS=""                     # pre-rewrite '<sha> refs/remotes/origin/<b>' lines, for --force-with-lease
 
 usage() {
     cat >&2 <<'EOF'
@@ -44,7 +45,7 @@ FLAGS
   --repo DIR       repository to operate on (default: current directory)
   --pattern REGEX  message lines to remove, grep -iE (default '^Co-Authored-By: Claude')
   --apply          actually rewrite history (default: dry-run only)
-  --push           force-push the rewritten branches after --apply
+  --push           force-push the rewritten branches and tags after --apply
   -h, --help
 
 Safe by default: without --apply it only reports. --apply always writes a git
@@ -80,6 +81,8 @@ _backup() {
 }
 
 _rewrite() {
+    # filter-branch rewrites refs/remotes/origin/* too, so snapshot what origin really has first.
+    ORIGIN_REFS=$(_git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin)
     local helper esc; helper=$(mktemp)
     esc=$(printf '%s' "$PATTERN" | sed "s/'/'\\\\''/g")   # single-quote-safe
     cat > "$helper" <<EOF
@@ -89,7 +92,7 @@ msg="\$(cat)"
 msg="\$(printf '%s\n' "\$msg" | grep -v -iE '${esc}' || true)"
 printf '%s\n' "\$msg"
 EOF
-    FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" -- --all >&2
+    FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
     rm -f "$helper"
     _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
     _git reflog expire --expire=now --all 2>/dev/null || true
@@ -97,12 +100,14 @@ EOF
 }
 
 _force_push() {
-    local b
+    local b lease
     while IFS= read -r b; do
         [[ -z "$b" ]] && continue
-        _git show-ref --verify --quiet "refs/remotes/origin/$b" || { info "skip $b (no origin branch)"; continue; }
-        if _git push --force origin "$b" >&2; then success "force-pushed $b"; else warn "push failed: $b"; fi
+        lease=$(printf '%s\n' "$ORIGIN_REFS" | awk -v r="refs/remotes/origin/$b" '$2 == r { print $1 }')
+        [[ -n "$lease" ]] || { info "skip $b (no origin branch)"; continue; }
+        if _git push --force-with-lease="refs/heads/$b:$lease" origin "$b" >&2; then success "force-pushed $b"; else warn "push failed: $b (remote moved? fetch, re-run)"; fi
     done < <(_git for-each-ref --format='%(refname:short)' refs/heads)
+    if _git push --force origin --tags >&2; then success "force-pushed tags"; else warn "push failed: tags"; fi
     warn "GitHub keeps merged-PR commits via refs/pull/* — those pages still show old commits; the Contributors graph clears on recompute."
 }
 
@@ -132,7 +137,7 @@ main() {
     _rewrite
     success "History cleaned locally."
     if [[ "$PUSH" == true ]]; then _force_push
-    else info "Not pushed. Use --push, or: cd $REPO && git push --force origin <branch>"; fi
+    else info "Not pushed. Use --push, or: cd $REPO && git push --force origin <branch> --tags"; fi
 }
 
 main "$@"
