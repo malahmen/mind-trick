@@ -51,6 +51,11 @@ FLAGS
 Safe by default: without --apply it only reports. --apply always writes a git
 bundle backup first. It cannot remove commits GitHub keeps in refs/pull/*
 (merged-PR pages) — only branch history + the Contributors graph clear.
+
+Rewrites every local ref (branches, tags, origin/* tracking refs). --push sends
+the local branches that exist on origin, plus tags; other remotes and remote-only
+branches are untouched. Signatures on rewritten commits are dropped. Refuses a
+dirty tree (untracked files count) and shallow clones.
 EOF
 }
 
