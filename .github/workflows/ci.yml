@@ -1,0 +1,42 @@
+name: ci
+
+# Every push and pull request. The suites need no network, no tokens and no
+# services: they work in temporary directories against file:// remotes and
+# stubbed clients, which is what makes them safe to run here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        # Printed because a suite that behaves differently on the runner than
+        # on a workstation is the thing hardest to debug from a log alone.
+        run: |
+          bash --version | head -1
+          git --version
+          shellcheck --version | sed -n 2p
+
+      - name: git-filter-repo
+        # The suite scrubs a real repository. Installed explicitly rather than
+        # relying on the runner still shipping filter-branch, which git 2.55
+        # removed — the very failure this tool now guards against.
+        run: |
+          python3 -m pip install --quiet git-filter-repo
+          git filter-repo --version
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning mind-trick.sh tests/run-all.sh tests/test-rewrite.sh 
+
+      - name: tests
+        run: tests/run-all.sh
