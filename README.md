@@ -1,5 +1,7 @@
 # mind-trick
 
+[![ci](https://github.com/malahmen/mind-trick/actions/workflows/ci.yml/badge.svg)](https://github.com/malahmen/mind-trick/actions/workflows/ci.yml)
+
 **`mind-trick.sh` — scrub commit-message trailers from git history.**
 
 > "These aren't the commits you're looking for."
@@ -22,8 +24,9 @@ History rewriting is destructive, so mind-trick is conservative:
   `~/.cache/mind-trick/` before rewriting (restore: `git clone <bundle>`).
 - **Refuses a dirty working tree** (untracked files count as dirty) and non-git
   directories.
-- **Refuses shallow clones** (`--depth`) — `filter-branch` would produce broken
-  history there. Run `git fetch --unshallow` first, or re-clone in full.
+- **Refuses shallow clones** (`--depth`) — neither rewrite engine can produce
+  sound history from a truncated one. Run `git fetch --unshallow` first, or
+  re-clone in full.
 - **Force-push is opt-in** (`--push`) — never automatic. Branches are pushed with
   `--force-with-lease` against the sha `origin` had before the rewrite, so a
   concurrent push is rejected instead of clobbered; tags are pushed with `--force`.
@@ -85,7 +88,7 @@ tests/run-all.sh
 MIND_TRICK=/path/to/mind-trick.sh tests/run-all.sh
 ```
 
-No network: synthetic repositories and `file://` remotes. Because this tool
+**18 checks.** No network: synthetic repositories and `file://` remotes. Because this tool
 rewrites published history and force-pushes it, the suite asserts the
 properties that make that acceptable rather than only that it runs:
 
@@ -104,6 +107,17 @@ properties that make that acceptable rather than only that it runs:
 
 Checked against deliberate regressions: stopping the stripping, and dropping
 `--force-with-lease`, each fail the suite.
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to
+`main`, every pull request, and on demand: versions, then `git-filter-repo`
+installed by the `curl` method above, then `shellcheck`, then the suite.
+
+The install step is not incidental. `test-rewrite.sh`'s control case needs a
+working rewrite engine, and the runner's git may have no `filter-branch` at
+all — so without it the suite's own baseline fails and every real assertion
+after it becomes meaningless.
 
 ## Install
 
