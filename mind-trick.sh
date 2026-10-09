@@ -33,6 +33,7 @@ APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
 ORIGIN_REFS=""                     # pre-rewrite '<sha> refs/remotes/origin/<b>' lines, for --force-with-lease
+ENGINE=""                          # which rewriting tool _preflight found
 
 usage() {
     cat >&2 <<'EOF'
@@ -98,7 +99,23 @@ msg="\$(cat)"
 msg="\$(printf '%s\n' "\$msg" | grep -v -iE '${esc}' || true)"
 printf '%s\n' "\$msg"
 EOF
-    FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
+    case "$ENGINE" in
+        filter-branch)
+            FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
+            ;;
+        filter-repo)
+            # Deliberately not implemented yet rather than quietly falling
+            # back: filter-repo's message rewriting is a --message-callback in
+            # Python, not a --msg-filter shell command, so it is a different
+            # code path and not one to write untested against published
+            # history. See the TODO in kamino (R9).
+            rm -f "$helper"
+            error_exit "filter-repo is installed but this tool has not been ported to it yet. Nothing was changed."
+            ;;
+        *)  rm -f "$helper"
+            error_exit "No rewrite engine selected — _preflight should have caught this."
+            ;;
+    esac
     rm -f "$helper"
     _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
     _git reflog expire --expire=now --all 2>/dev/null || true
@@ -117,10 +134,54 @@ _force_push() {
     warn "GitHub keeps merged-PR commits via refs/pull/* — those pages still show old commits; the Contributors graph clears on recompute."
 }
 
+# _rewrite_engine — which history-rewriting tool this machine actually has.
+#
+# 'git filter-branch' was deprecated for years and is GONE from git 2.55: not
+# in the exec-path, not a subcommand. This tool called it anyway, so on a
+# current git it enumerated the commits, wrote a backup bundle, and then
+# printed git's own "'filter-branch' is not a git command" — after announcing
+# success at the backup, which reads like the rewrite happened.
+#
+# filter-repo is the upstream replacement and is preferred where both exist.
+_rewrite_engine() {
+    if git filter-repo --version &>/dev/null; then
+        printf 'filter-repo'; return 0
+    fi
+    # Captured, then matched — NOT piped into grep. `git filter-branch -h`
+    # exits non-zero even where the builtin exists, and under 'set -o pipefail'
+    # (which this script sets) the pipeline then reports failure however grep
+    # answered. So `! git ... | grep -q` was true in both cases and this
+    # function claimed filter-branch on a git that has none — which is how the
+    # missing-engine guard ended up selecting the missing engine.
+    local out
+    out="$(git filter-branch -h 2>&1 || true)"
+    case "$out" in
+        *"is not a git command"*) return 1 ;;
+        *) printf 'filter-branch'; return 0 ;;
+    esac
+}
+
 _preflight() {
     _git rev-parse --is-inside-work-tree &>/dev/null || error_exit "Not a git repository: $REPO"
-    [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — filter-branch would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
+    [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — rewriting would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
     [[ -z "$(_git status --porcelain)" ]] || error_exit "Working tree not clean in $REPO — commit/stash first."
+
+    # Checked HERE, before the backup and before anything is announced: the
+    # run cannot succeed without an engine, and discovering that after writing
+    # a bundle and reporting it is how a failure gets mistaken for a success.
+    ENGINE="$(_rewrite_engine)" || {
+        warn "No history-rewriting tool available."
+        warn "  'git filter-branch' was removed in git 2.55 (this host has $(git --version | awk '{print $3}'))"
+        warn "  and 'git filter-repo' is not installed."
+        warn ""
+        warn "  Install filter-repo, which is one Python file and needs no root:"
+        warn "    pip install --user git-filter-repo"
+        warn "  or drop it in by hand:"
+        warn "    curl -fsSL https://raw.githubusercontent.com/newren/git-filter-repo/main/git-filter-repo \\"
+        warn "      -o ~/.local/bin/git-filter-repo && chmod +x ~/.local/bin/git-filter-repo"
+        error_exit "Nothing was changed."
+    }
+    info "Rewrite engine: ${ENGINE}"
 }
 
 main() {
