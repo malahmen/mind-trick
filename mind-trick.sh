@@ -33,6 +33,7 @@ APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
 ORIGIN_REFS=""                     # pre-rewrite '<sha> refs/remotes/origin/<b>' lines, for --force-with-lease
+ENGINE=""                          # which rewriting tool _preflight found
 
 usage() {
     cat >&2 <<'EOF'
@@ -87,8 +88,24 @@ _backup() {
 }
 
 _rewrite() {
-    # filter-branch rewrites refs/remotes/origin/* too, so snapshot what origin really has first.
+    # Snapshotted BEFORE the rewrite, because both engines destroy it:
+    # filter-branch rewrites refs/remotes/origin/* too, and filter-repo
+    # deletes the remotes outright. These shas are the --force-with-lease
+    # expectations later.
     ORIGIN_REFS=$(_git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin)
+
+    case "$ENGINE" in
+        filter-branch) _rewrite_filter_branch ;;
+        filter-repo)   _rewrite_filter_repo ;;
+        *)             error_exit "No rewrite engine selected — _preflight should have caught this." ;;
+    esac
+
+    _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
+    _git reflog expire --expire=now --all 2>/dev/null || true
+    _git gc --prune=now --quiet 2>/dev/null || true
+}
+
+_rewrite_filter_branch() {
     local helper esc; helper=$(mktemp)
     esc=$(printf '%s' "$PATTERN" | sed "s/'/'\\\\''/g")   # single-quote-safe
     cat > "$helper" <<EOF
@@ -99,10 +116,45 @@ msg="\$(printf '%s\n' "\$msg" | grep -v -iE '${esc}' || true)"
 printf '%s\n' "\$msg"
 EOF
     FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
+    local rc=$?
     rm -f "$helper"
-    _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
-    _git reflog expire --expire=now --all 2>/dev/null || true
-    _git gc --prune=now --quiet 2>/dev/null || true
+    [[ $rc -eq 0 ]] || error_exit "filter-branch failed — nothing pushed."
+}
+
+_rewrite_filter_repo() {
+    # filter-repo DELETES THE REMOTES. Measured on a clone of the backup
+    # bundle: afterwards `git remote` is empty and refs/remotes holds nothing.
+    # That is deliberate upstream — it expects to run in a fresh clone you
+    # then push from on purpose — but this tool pushes back to the remote it
+    # just rewrote, so the URLs are snapshotted and put back.
+    local remotes_snapshot
+    remotes_snapshot="$(_git remote -v | awk '$3=="(push)" {print $1"\t"$2}')"
+
+    # --force because the repository is not a fresh clone, and because
+    # filter-repo leaves .git/filter-repo/already_ran behind, which blocks a
+    # second run without it.
+    #
+    # The pattern reaches Python through the ENVIRONMENT rather than being
+    # interpolated into the callback source: it is user-supplied, and a
+    # --pattern containing a quote would otherwise be executable code.
+    #
+    # grep -iE and Python's re agree on the patterns this tool is for (a
+    # trailer key anchored with ^); they are not the same dialect, so an
+    # exotic ERE could behave differently between the two engines.
+    MT_PATTERN="$PATTERN" _git filter-repo --force --message-callback '
+import os, re
+_rx = re.compile(os.environ["MT_PATTERN"].encode(), re.IGNORECASE)
+return b"\n".join(l for l in message.split(b"\n") if not _rx.search(l))
+' >&2 || error_exit "filter-repo failed — nothing pushed."
+
+    local name url
+    while IFS=$'\t' read -r name url; do
+        [[ -n "$name" ]] || continue
+        _git remote get-url "$name" &>/dev/null || {
+            _git remote add "$name" "$url"
+            info "restored remote '${name}' (filter-repo removes them)"
+        }
+    done <<< "$remotes_snapshot"
 }
 
 _force_push() {
@@ -117,10 +169,54 @@ _force_push() {
     warn "GitHub keeps merged-PR commits via refs/pull/* — those pages still show old commits; the Contributors graph clears on recompute."
 }
 
+# _rewrite_engine — which history-rewriting tool this machine actually has.
+#
+# 'git filter-branch' was deprecated for years and is GONE from git 2.55: not
+# in the exec-path, not a subcommand. This tool called it anyway, so on a
+# current git it enumerated the commits, wrote a backup bundle, and then
+# printed git's own "'filter-branch' is not a git command" — after announcing
+# success at the backup, which reads like the rewrite happened.
+#
+# filter-repo is the upstream replacement and is preferred where both exist.
+_rewrite_engine() {
+    if git filter-repo --version &>/dev/null; then
+        printf 'filter-repo'; return 0
+    fi
+    # Captured, then matched — NOT piped into grep. `git filter-branch -h`
+    # exits non-zero even where the builtin exists, and under 'set -o pipefail'
+    # (which this script sets) the pipeline then reports failure however grep
+    # answered. So `! git ... | grep -q` was true in both cases and this
+    # function claimed filter-branch on a git that has none — which is how the
+    # missing-engine guard ended up selecting the missing engine.
+    local out
+    out="$(git filter-branch -h 2>&1 || true)"
+    case "$out" in
+        *"is not a git command"*) return 1 ;;
+        *) printf 'filter-branch'; return 0 ;;
+    esac
+}
+
 _preflight() {
     _git rev-parse --is-inside-work-tree &>/dev/null || error_exit "Not a git repository: $REPO"
-    [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — filter-branch would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
+    [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — rewriting would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
     [[ -z "$(_git status --porcelain)" ]] || error_exit "Working tree not clean in $REPO — commit/stash first."
+
+    # Checked HERE, before the backup and before anything is announced: the
+    # run cannot succeed without an engine, and discovering that after writing
+    # a bundle and reporting it is how a failure gets mistaken for a success.
+    ENGINE="$(_rewrite_engine)" || {
+        warn "No history-rewriting tool available."
+        warn "  'git filter-branch' was removed in git 2.55 (this host has $(git --version | awk '{print $3}'))"
+        warn "  and 'git filter-repo' is not installed."
+        warn ""
+        warn "  Install filter-repo, which is one Python file and needs no root:"
+        warn "    pip install --user git-filter-repo"
+        warn "  or drop it in by hand:"
+        warn "    curl -fsSL https://raw.githubusercontent.com/newren/git-filter-repo/main/git-filter-repo \\"
+        warn "      -o ~/.local/bin/git-filter-repo && chmod +x ~/.local/bin/git-filter-repo"
+        error_exit "Nothing was changed."
+    }
+    info "Rewrite engine: ${ENGINE}"
 }
 
 main() {
