@@ -88,8 +88,24 @@ _backup() {
 }
 
 _rewrite() {
-    # filter-branch rewrites refs/remotes/origin/* too, so snapshot what origin really has first.
+    # Snapshotted BEFORE the rewrite, because both engines destroy it:
+    # filter-branch rewrites refs/remotes/origin/* too, and filter-repo
+    # deletes the remotes outright. These shas are the --force-with-lease
+    # expectations later.
     ORIGIN_REFS=$(_git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin)
+
+    case "$ENGINE" in
+        filter-branch) _rewrite_filter_branch ;;
+        filter-repo)   _rewrite_filter_repo ;;
+        *)             error_exit "No rewrite engine selected — _preflight should have caught this." ;;
+    esac
+
+    _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
+    _git reflog expire --expire=now --all 2>/dev/null || true
+    _git gc --prune=now --quiet 2>/dev/null || true
+}
+
+_rewrite_filter_branch() {
     local helper esc; helper=$(mktemp)
     esc=$(printf '%s' "$PATTERN" | sed "s/'/'\\\\''/g")   # single-quote-safe
     cat > "$helper" <<EOF
@@ -99,27 +115,46 @@ msg="\$(cat)"
 msg="\$(printf '%s\n' "\$msg" | grep -v -iE '${esc}' || true)"
 printf '%s\n' "\$msg"
 EOF
-    case "$ENGINE" in
-        filter-branch)
-            FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
-            ;;
-        filter-repo)
-            # Deliberately not implemented yet rather than quietly falling
-            # back: filter-repo's message rewriting is a --message-callback in
-            # Python, not a --msg-filter shell command, so it is a different
-            # code path and not one to write untested against published
-            # history. See the TODO in kamino (R9).
-            rm -f "$helper"
-            error_exit "filter-repo is installed but this tool has not been ported to it yet. Nothing was changed."
-            ;;
-        *)  rm -f "$helper"
-            error_exit "No rewrite engine selected — _preflight should have caught this."
-            ;;
-    esac
+    FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
+    local rc=$?
     rm -f "$helper"
-    _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
-    _git reflog expire --expire=now --all 2>/dev/null || true
-    _git gc --prune=now --quiet 2>/dev/null || true
+    [[ $rc -eq 0 ]] || error_exit "filter-branch failed — nothing pushed."
+}
+
+_rewrite_filter_repo() {
+    # filter-repo DELETES THE REMOTES. Measured on a clone of the backup
+    # bundle: afterwards `git remote` is empty and refs/remotes holds nothing.
+    # That is deliberate upstream — it expects to run in a fresh clone you
+    # then push from on purpose — but this tool pushes back to the remote it
+    # just rewrote, so the URLs are snapshotted and put back.
+    local remotes_snapshot
+    remotes_snapshot="$(_git remote -v | awk '$3=="(push)" {print $1"\t"$2}')"
+
+    # --force because the repository is not a fresh clone, and because
+    # filter-repo leaves .git/filter-repo/already_ran behind, which blocks a
+    # second run without it.
+    #
+    # The pattern reaches Python through the ENVIRONMENT rather than being
+    # interpolated into the callback source: it is user-supplied, and a
+    # --pattern containing a quote would otherwise be executable code.
+    #
+    # grep -iE and Python's re agree on the patterns this tool is for (a
+    # trailer key anchored with ^); they are not the same dialect, so an
+    # exotic ERE could behave differently between the two engines.
+    MT_PATTERN="$PATTERN" _git filter-repo --force --message-callback '
+import os, re
+_rx = re.compile(os.environ["MT_PATTERN"].encode(), re.IGNORECASE)
+return b"\n".join(l for l in message.split(b"\n") if not _rx.search(l))
+' >&2 || error_exit "filter-repo failed — nothing pushed."
+
+    local name url
+    while IFS=$'\t' read -r name url; do
+        [[ -n "$name" ]] || continue
+        _git remote get-url "$name" &>/dev/null || {
+            _git remote add "$name" "$url"
+            info "restored remote '${name}' (filter-repo removes them)"
+        }
+    done <<< "$remotes_snapshot"
 }
 
 _force_push() {
