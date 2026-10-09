@@ -158,4 +158,4 @@ chmod +x mind-trick.sh
 
 ## License
 
-Released under the [Unlicense](LICENSE).
+[MIT](LICENSE) © 2026 malahmen.
