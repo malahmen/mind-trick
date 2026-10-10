@@ -6,6 +6,11 @@
 # asserted are the ones that make that acceptable: the trailers go, nothing
 # else changes, no commits are lost, a moved remote is refused rather than
 # overwritten, and a missing engine stops the run before the backup.
+# shellcheck disable=SC2016
+# One check below passes $T to `bash -c` as a positional argument and reads it
+# as $1 inside single quotes, which is the safe way round: a captured path
+# interpolated into a command line is not. A directive covers only the next
+# COMMAND, so this is file-scoped and sits above the first one.
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
