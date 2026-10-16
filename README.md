@@ -62,18 +62,24 @@ after pushing.
 
 `filter-branch` was deprecated for years and is **gone from git 2.55**: not a
 subcommand, not in the exec-path. If you are on 2.55 or later, filter-repo is
-not optional. It is a single Python script and needs no root:
+not optional. It is a single Python script and needs no root, and mind-trick
+installs it for you:
 
 ```sh
-pip install --user git-filter-repo
-# or
-curl -fsSL https://raw.githubusercontent.com/newren/git-filter-repo/main/git-filter-repo \
-  -o ~/.local/bin/git-filter-repo && chmod +x ~/.local/bin/git-filter-repo
+./mind-trick.sh --setup
 ```
 
-It is checked for before anything is done. A run with no engine stops before
-the backup is written and says what to install, rather than discovering it
-after announcing a backup as the earlier version did.
+That downloads filter-repo 2.47.0 (pinned), checks it against the sha256 of the
+file in that release's tarball, and puts it in `~/.local/bin` (or
+`$XDG_BIN_HOME`, or `$MIND_TRICK_BIN_DIR`). It needs `python3` and `curl`. A
+download that fails the checksum is deleted, not installed. mind-trick looks in
+that directory even when it is not on your `PATH`.
+
+It is checked for after the report and before anything is done. A dry run
+still lists what matches; a repo with nothing to scrub never needs it. A run
+that would rewrite, with no engine, stops before the backup is written, says
+to run `--setup`, and exits with status **3**, so a front-end can offer the
+install and retry.
 
 One behaviour worth knowing, because it is surprising: **filter-repo deletes
 the repository's remotes.** That is deliberate upstream — it expects to run in
@@ -88,7 +94,7 @@ tests/run-all.sh
 MIND_TRICK=/path/to/mind-trick.sh tests/run-all.sh
 ```
 
-**18 checks.** No network: synthetic repositories and `file://` remotes. Because this tool
+**29 checks.** No network: synthetic repositories and `file://` remotes. Because this tool
 rewrites published history and force-pushes it, the suite asserts the
 properties that make that acceptable rather than only that it runs:
 
@@ -103,7 +109,11 @@ properties that make that acceptable rather than only that it runs:
   teammate's commit and their trailers both survive;
 - the remotes filter-repo removed are back;
 - with no engine on PATH the run stops before the backup and leaves the
-  branch untouched.
+  branch untouched;
+- with no engine, a dry run still lists the matches and exits 3, and a repo
+  with nothing to scrub still exits 0;
+- `--setup` refuses (and deletes) a download that fails the checksum, and
+  leaves an installed filter-repo alone.
 
 Checked against deliberate regressions: stopping the stripping, and dropping
 `--force-with-lease`, each fail the suite.
@@ -112,7 +122,8 @@ Checked against deliberate regressions: stopping the stripping, and dropping
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to
 `main`, every pull request, and on demand: versions, then `git-filter-repo`
-installed by the `curl` method above, then `shellcheck`, then the suite.
+installed with `./mind-trick.sh --setup` (so the pinned download and its
+checksum are tested too), then `shellcheck`, then the suite.
 
 The install step is not incidental. `test-rewrite.sh`'s control case needs a
 working rewrite engine, and the runner's git may have no `filter-branch` at
@@ -149,7 +160,11 @@ chmod +x mind-trick.sh
 | `--pattern REGEX` | message lines to remove, `grep -iE` (default `^Co-Authored-By: Claude`) |
 | `--apply` | actually rewrite history (default: dry-run) |
 | `--push` | force-push the rewritten branches and tags after `--apply` |
+| `--setup` | install `git filter-repo` (pinned, checksum-verified) into `~/.local/bin` |
 | `-h`, `--help` | show help |
+
+Exit status: `0` done or nothing matched, `1` error, `3` matches but no rewrite
+tool (run `--setup`).
 
 ## Notes
 

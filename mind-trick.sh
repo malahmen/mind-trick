@@ -12,7 +12,8 @@
 # GitHub's refs/pull/* — merged-PR pages keep their old commits; only branch
 # history (and the Contributors graph, on recompute) is cleaned.
 #
-# Dependency: git. Run --help for the flags.
+# Dependency: git, plus a rewrite tool: git filter-repo (--setup installs it)
+# or git filter-branch (gone from git 2.55). Run --help for the flags.
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -33,7 +34,20 @@ APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
 ORIGIN_REFS=""                     # pre-rewrite '<sha> refs/remotes/origin/<b>' lines, for --force-with-lease
-ENGINE=""                          # which rewriting tool _preflight found
+ENGINE=""                          # which rewriting tool _need_engine found
+
+# What --setup installs: one pinned filter-repo release, checked against the
+# sha256 of the file in its release tarball, into a user dir (no root, no pip).
+FILTER_REPO_VERSION="2.47.0"
+FILTER_REPO_SHA256="67447413e273fc76809289111748870b6f6072f08b17efe94863a92d810b7d94"
+FILTER_REPO_URL="${MIND_TRICK_FILTER_REPO_URL:-https://raw.githubusercontent.com/newren/git-filter-repo/v${FILTER_REPO_VERSION}/git-filter-repo}"
+BIN_DIR="${MIND_TRICK_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+# Searched even when it is not on the user's PATH, so a --setup install works
+# at once (and from a launcher whose PATH never had ~/.local/bin).
+USER_PATH="$PATH"
+PATH="${BIN_DIR}:${PATH}"
+
+EXIT_NO_ENGINE=3                   # matches exist but nothing here can rewrite them
 
 usage() {
     cat >&2 <<'EOF'
@@ -41,13 +55,19 @@ mind-trick — scrub commit-message trailers from git history
 
 USAGE
   mind-trick.sh [--repo DIR] [--pattern REGEX] [--apply] [--push]
+  mind-trick.sh --setup
 
 FLAGS
   --repo DIR       repository to operate on (default: current directory)
   --pattern REGEX  message lines to remove, grep -iE (default '^Co-Authored-By: Claude')
   --apply          actually rewrite history (default: dry-run only)
   --push           force-push the rewritten branches and tags after --apply
+  --setup          install git filter-repo (pinned, checksum-verified) into
+                   ~/.local/bin; no root, no pip. Needs python3 and curl.
   -h, --help
+
+EXIT STATUS
+  0 done, or nothing matched   1 error   3 matches, but no rewrite tool (run --setup)
 
 Safe by default: without --apply it only reports. --apply always writes a git
 bundle backup first. It cannot remove commits GitHub keeps in refs/pull/*
@@ -97,7 +117,7 @@ _rewrite() {
     case "$ENGINE" in
         filter-branch) _rewrite_filter_branch ;;
         filter-repo)   _rewrite_filter_repo ;;
-        *)             error_exit "No rewrite engine selected — _preflight should have caught this." ;;
+        *)             error_exit "No rewrite engine selected — _need_engine should have caught this." ;;
     esac
 
     _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
@@ -200,23 +220,58 @@ _preflight() {
     _git rev-parse --is-inside-work-tree &>/dev/null || error_exit "Not a git repository: $REPO"
     [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — rewriting would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
     [[ -z "$(_git status --porcelain)" ]] || error_exit "Working tree not clean in $REPO — commit/stash first."
+}
 
-    # Checked HERE, before the backup and before anything is announced: the
-    # run cannot succeed without an engine, and discovering that after writing
-    # a bundle and reporting it is how a failure gets mistaken for a success.
+# _need_engine — stop here if this machine cannot rewrite history.
+#
+# Called after _report and before the backup: the run cannot succeed without
+# an engine, and discovering that after writing a bundle and reporting it is
+# how a failure gets mistaken for a success. Not part of _preflight, because a
+# dry run must still list what matches, and a repo with nothing to scrub has
+# no use for an engine at all.
+_need_engine() {
     ENGINE="$(_rewrite_engine)" || {
         warn "No history-rewriting tool available."
         warn "  'git filter-branch' was removed in git 2.55 (this host has $(git --version | awk '{print $3}'))"
         warn "  and 'git filter-repo' is not installed."
         warn ""
-        warn "  Install filter-repo, which is one Python file and needs no root:"
-        warn "    pip install --user git-filter-repo"
-        warn "  or drop it in by hand:"
-        warn "    curl -fsSL https://raw.githubusercontent.com/newren/git-filter-repo/main/git-filter-repo \\"
-        warn "      -o ~/.local/bin/git-filter-repo && chmod +x ~/.local/bin/git-filter-repo"
-        error_exit "Nothing was changed."
+        warn "  Install it (one Python file, into ${BIN_DIR}, no root):"
+        warn "    $(basename "$0") --setup"
+        printf '%s[error]%s %s\n' "$C_R" "$C_N" "Nothing was changed." >&2
+        exit "$EXIT_NO_ENGINE"
     }
     info "Rewrite engine: ${ENGINE}"
+}
+
+_sha256() {
+    if command -v sha256sum &>/dev/null; then sha256sum "$1" | awk '{print $1}'
+    else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+# _setup — install the pinned git-filter-repo into $BIN_DIR.
+_setup() {
+    if git filter-repo --version &>/dev/null; then
+        success "git filter-repo is already installed: $(command -v git-filter-repo)"
+        return 0
+    fi
+    command -v python3 &>/dev/null || error_exit "git filter-repo needs python3, which is not installed."
+    command -v curl &>/dev/null    || error_exit "curl is needed to download git filter-repo."
+    mkdir -p "$BIN_DIR" || error_exit "Cannot create ${BIN_DIR}."
+    local tmp; tmp="$(mktemp "${BIN_DIR}/.git-filter-repo.XXXXXX")"
+    info "Downloading git filter-repo ${FILTER_REPO_VERSION}…"
+    curl -fsSL "$FILTER_REPO_URL" -o "$tmp" || { rm -f "$tmp"; error_exit "Download failed: ${FILTER_REPO_URL}"; }
+    local got; got="$(_sha256 "$tmp")"
+    if [[ "$got" != "$FILTER_REPO_SHA256" ]]; then
+        rm -f "$tmp"
+        error_exit "Checksum mismatch for git filter-repo (got ${got}) — not installed."
+    fi
+    chmod 755 "$tmp" && mv -f "$tmp" "${BIN_DIR}/git-filter-repo"
+    git filter-repo --version &>/dev/null || error_exit "git filter-repo was installed to ${BIN_DIR} but does not run (python3 too old?)."
+    success "git filter-repo ${FILTER_REPO_VERSION} installed to ${BIN_DIR}/git-filter-repo"
+    case ":${USER_PATH}:" in
+        *":${BIN_DIR}:"*) ;;
+        *) info "mind-trick finds it there on its own; to run 'git filter-repo' yourself, add ${BIN_DIR} to your PATH." ;;
+    esac
 }
 
 main() {
@@ -225,6 +280,7 @@ main() {
         --pattern) PATTERN="$2"; shift 2 ;;
         --apply) APPLY=true; shift ;;
         --push) PUSH=true; shift ;;
+        --setup) _setup; exit 0 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; error_exit "unknown flag: $1" ;;
     esac; done
@@ -232,6 +288,7 @@ main() {
 
     _preflight
     _report || exit 0
+    _need_engine
     if [[ "$APPLY" != true ]]; then
         info "Dry run — re-run with --apply to rewrite (and --push to force-push)."
         exit 0

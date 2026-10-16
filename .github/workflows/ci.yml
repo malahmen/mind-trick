@@ -29,10 +29,12 @@ jobs:
       - name: git-filter-repo
         # The suite scrubs a real repository. Installed explicitly rather than
         # relying on the runner still shipping filter-branch, which git 2.55
-        # removed — the very failure this tool now guards against.
+        # removed — the very failure this tool now guards against. Through
+        # --setup, so the pinned download and its checksum are exercised too.
         run: |
-          python3 -m pip install --quiet git-filter-repo
-          git filter-repo --version
+          ./mind-trick.sh --setup
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/git-filter-repo" --version
 
       - name: shellcheck
         run: |
