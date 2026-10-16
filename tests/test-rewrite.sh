@@ -22,6 +22,9 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 # Keep the tool's backups out of the real cache.
 export XDG_CACHE_HOME="$T/cache"
+# And --setup's install dir out of ~/.local/bin, which the engine searches: a
+# filter-repo the user installed there would defeat the "no engine" cases.
+export MIND_TRICK_BIN_DIR="$T/bin"
 
 FAILS=0
 check() { local d="$1"; shift; if "$@"; then echo "   ok   - $d"; else echo "   FAIL - $d"; FAILS=$((FAILS + 1)); fi; }
@@ -96,13 +99,27 @@ echo "## 5. no engine: a dry run still reports, a clean repo still passes"
 out="$(PATH=/usr/bin:/bin bash "$MT" --repo "$T/d" 2>&1)"; rc=$?
 check "the matches are still listed"       bash -c "printf '%s' \"\$1\" | grep -q '3 commit(s) contain'" _ "$out"
 check "then it says there is no tool"      bash -c "printf '%s' \"\$1\" | grep -q 'No history-rewriting tool'" _ "$out"
-check "and fails, so a caller stops there" [ "$rc" -ne 0 ]
+check "and exits 3, so a caller can offer --setup" [ "$rc" -eq 3 ]
 git init -q -b master "$T/e"
 git -C "$T/e" commit -q --allow-empty -m "nothing to scrub"
 out="$(PATH=/usr/bin:/bin bash "$MT" --repo "$T/e" 2>&1)"; rc=$?
 check "a clean repo says nothing to do"    bash -c "printf '%s' \"\$1\" | grep -q 'nothing to do'" _ "$out"
 check "without asking for a tool"          bash -c "! printf '%s' \"\$1\" | grep -q 'No history-rewriting tool'" _ "$out"
 check "and succeeds"                       [ "$rc" -eq 0 ]
+
+echo "## 6. --setup refuses a download that fails the checksum"
+printf '#!/usr/bin/env python3\nprint("not filter-repo")\n' > "$T/evil"
+out="$(PATH=/usr/bin:/bin MIND_TRICK_FILTER_REPO_URL="file://$T/evil" bash "$MT" --setup 2>&1)"; rc=$?
+check "it fails"                           [ "$rc" -ne 0 ]
+check "it names the checksum"              bash -c "printf '%s' \"\$1\" | grep -q 'Checksum mismatch'" _ "$out"
+check "nothing was installed"              bash -c "[ -z \"\$(ls -A '$T/bin' 2>/dev/null)\" ]"
+
+echo "## 7. --setup leaves an installed filter-repo alone"
+mkdir -p "$T/have"
+printf '#!/bin/sh\necho a40bce548d2c\n' > "$T/have/git-filter-repo"; chmod +x "$T/have/git-filter-repo"
+out="$(PATH="$T/have:/usr/bin:/bin" MIND_TRICK_FILTER_REPO_URL="file://$T/evil" bash "$MT" --setup 2>&1)"; rc=$?
+check "it succeeds without downloading"    [ "$rc" -eq 0 ]
+check "it says it is already installed"    bash -c "printf '%s' \"\$1\" | grep -q 'already installed'" _ "$out"
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi
