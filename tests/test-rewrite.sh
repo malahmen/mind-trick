@@ -92,6 +92,18 @@ check "it says nothing was changed"        bash -c "printf '%s' \"\$1\" | grep -
 check "master is untouched"                [ "$(git -C "$T/d" rev-parse master)" = "$sha" ]
 check "and no backup was written for it"   bash -c "! ls '$T/cache/mind-trick'/*-d-*.bundle >/dev/null 2>&1"
 
+echo "## 5. no engine: a dry run still reports, a clean repo still passes"
+out="$(PATH=/usr/bin:/bin bash "$MT" --repo "$T/d" 2>&1)"; rc=$?
+check "the matches are still listed"       bash -c "printf '%s' \"\$1\" | grep -q '3 commit(s) contain'" _ "$out"
+check "then it says there is no tool"      bash -c "printf '%s' \"\$1\" | grep -q 'No history-rewriting tool'" _ "$out"
+check "and fails, so a caller stops there" [ "$rc" -ne 0 ]
+git init -q -b master "$T/e"
+git -C "$T/e" commit -q --allow-empty -m "nothing to scrub"
+out="$(PATH=/usr/bin:/bin bash "$MT" --repo "$T/e" 2>&1)"; rc=$?
+check "a clean repo says nothing to do"    bash -c "printf '%s' \"\$1\" | grep -q 'nothing to do'" _ "$out"
+check "without asking for a tool"          bash -c "! printf '%s' \"\$1\" | grep -q 'No history-rewriting tool'" _ "$out"
+check "and succeeds"                       [ "$rc" -eq 0 ]
+
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi
 echo "all checks passed"

@@ -33,7 +33,7 @@ APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
 ORIGIN_REFS=""                     # pre-rewrite '<sha> refs/remotes/origin/<b>' lines, for --force-with-lease
-ENGINE=""                          # which rewriting tool _preflight found
+ENGINE=""                          # which rewriting tool _need_engine found
 
 usage() {
     cat >&2 <<'EOF'
@@ -97,7 +97,7 @@ _rewrite() {
     case "$ENGINE" in
         filter-branch) _rewrite_filter_branch ;;
         filter-repo)   _rewrite_filter_repo ;;
-        *)             error_exit "No rewrite engine selected — _preflight should have caught this." ;;
+        *)             error_exit "No rewrite engine selected — _need_engine should have caught this." ;;
     esac
 
     _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
@@ -200,10 +200,16 @@ _preflight() {
     _git rev-parse --is-inside-work-tree &>/dev/null || error_exit "Not a git repository: $REPO"
     [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — rewriting would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
     [[ -z "$(_git status --porcelain)" ]] || error_exit "Working tree not clean in $REPO — commit/stash first."
+}
 
-    # Checked HERE, before the backup and before anything is announced: the
-    # run cannot succeed without an engine, and discovering that after writing
-    # a bundle and reporting it is how a failure gets mistaken for a success.
+# _need_engine — stop here if this machine cannot rewrite history.
+#
+# Called after _report and before the backup: the run cannot succeed without
+# an engine, and discovering that after writing a bundle and reporting it is
+# how a failure gets mistaken for a success. Not part of _preflight, because a
+# dry run must still list what matches, and a repo with nothing to scrub has
+# no use for an engine at all.
+_need_engine() {
     ENGINE="$(_rewrite_engine)" || {
         warn "No history-rewriting tool available."
         warn "  'git filter-branch' was removed in git 2.55 (this host has $(git --version | awk '{print $3}'))"
@@ -232,6 +238,7 @@ main() {
 
     _preflight
     _report || exit 0
+    _need_engine
     if [[ "$APPLY" != true ]]; then
         info "Dry run — re-run with --apply to rewrite (and --push to force-push)."
         exit 0
