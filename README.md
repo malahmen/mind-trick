@@ -94,7 +94,7 @@ tests/run-all.sh
 MIND_TRICK=/path/to/mind-trick.sh tests/run-all.sh
 ```
 
-**18 checks.** No network: synthetic repositories and `file://` remotes. Because this tool
+**29 checks.** No network: synthetic repositories and `file://` remotes. Because this tool
 rewrites published history and force-pushes it, the suite asserts the
 properties that make that acceptable rather than only that it runs:
 
@@ -109,7 +109,11 @@ properties that make that acceptable rather than only that it runs:
   teammate's commit and their trailers both survive;
 - the remotes filter-repo removed are back;
 - with no engine on PATH the run stops before the backup and leaves the
-  branch untouched.
+  branch untouched;
+- with no engine, a dry run still lists the matches and exits 3, and a repo
+  with nothing to scrub still exits 0;
+- `--setup` refuses (and deletes) a download that fails the checksum, and
+  leaves an installed filter-repo alone.
 
 Checked against deliberate regressions: stopping the stripping, and dropping
 `--force-with-lease`, each fail the suite.
