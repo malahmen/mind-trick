@@ -26,6 +26,22 @@ export XDG_CACHE_HOME="$T/cache"
 # filter-repo the user installed there would defeat the "no engine" cases.
 export MIND_TRICK_BIN_DIR="$T/bin"
 
+# A PATH with no rewrite tool on it, whatever this git is. Trimming PATH to
+# /usr/bin:/bin hides a filter-repo in ~/.local/bin, but not filter-branch:
+# that is part of git itself, and a git older than 2.55 (CI runners) still has
+# it. So the first git on this PATH refuses both and hands the rest to git.
+REAL_GIT="$(command -v git)"
+mkdir -p "$T/no-engine"
+cat > "$T/no-engine/git" <<NOGIT
+#!/bin/sh
+case "\$1" in
+    filter-branch|filter-repo) echo "git: '\$1' is not a git command. See 'git --help'." >&2; exit 1 ;;
+esac
+exec "$REAL_GIT" "\$@"
+NOGIT
+chmod +x "$T/no-engine/git"
+NO_ENGINE_PATH="$T/no-engine:/usr/bin:/bin"
+
 FAILS=0
 check() { local d="$1"; shift; if "$@"; then echo "   ok   - $d"; else echo "   FAIL - $d"; FAILS=$((FAILS + 1)); fi; }
 trailers() { git -C "$1" log "${2:-master}" --format='%(trailers:key=Co-Authored-By)' | grep -c . || true; }
@@ -89,27 +105,27 @@ check "the remote still has its trailers"  [ "$(trailers "$T/c-origin.git")" = 3
 echo "## 4. no engine: refuse before the backup"
 fixture "$T/d"
 sha="$(git -C "$T/d" rev-parse master)"
-out="$(PATH=/usr/bin:/bin bash "$MT" --repo "$T/d" --apply --push 2>&1)"
+out="$(PATH="$NO_ENGINE_PATH" bash "$MT" --repo "$T/d" --apply --push 2>&1)"
 check "it says there is no tool"           bash -c "printf '%s' \"\$1\" | grep -q 'No history-rewriting tool'" _ "$out"
 check "it says nothing was changed"        bash -c "printf '%s' \"\$1\" | grep -q 'Nothing was changed'" _ "$out"
 check "master is untouched"                [ "$(git -C "$T/d" rev-parse master)" = "$sha" ]
 check "and no backup was written for it"   bash -c "! ls '$T/cache/mind-trick'/*-d-*.bundle >/dev/null 2>&1"
 
 echo "## 5. no engine: a dry run still reports, a clean repo still passes"
-out="$(PATH=/usr/bin:/bin bash "$MT" --repo "$T/d" 2>&1)"; rc=$?
+out="$(PATH="$NO_ENGINE_PATH" bash "$MT" --repo "$T/d" 2>&1)"; rc=$?
 check "the matches are still listed"       bash -c "printf '%s' \"\$1\" | grep -q '3 commit(s) contain'" _ "$out"
 check "then it says there is no tool"      bash -c "printf '%s' \"\$1\" | grep -q 'No history-rewriting tool'" _ "$out"
 check "and exits 3, so a caller can offer --setup" [ "$rc" -eq 3 ]
 git init -q -b master "$T/e"
 git -C "$T/e" commit -q --allow-empty -m "nothing to scrub"
-out="$(PATH=/usr/bin:/bin bash "$MT" --repo "$T/e" 2>&1)"; rc=$?
+out="$(PATH="$NO_ENGINE_PATH" bash "$MT" --repo "$T/e" 2>&1)"; rc=$?
 check "a clean repo says nothing to do"    bash -c "printf '%s' \"\$1\" | grep -q 'nothing to do'" _ "$out"
 check "without asking for a tool"          bash -c "! printf '%s' \"\$1\" | grep -q 'No history-rewriting tool'" _ "$out"
 check "and succeeds"                       [ "$rc" -eq 0 ]
 
 echo "## 6. --setup refuses a download that fails the checksum"
 printf '#!/usr/bin/env python3\nprint("not filter-repo")\n' > "$T/evil"
-out="$(PATH=/usr/bin:/bin MIND_TRICK_FILTER_REPO_URL="file://$T/evil" bash "$MT" --setup 2>&1)"; rc=$?
+out="$(PATH="$NO_ENGINE_PATH" MIND_TRICK_FILTER_REPO_URL="file://$T/evil" bash "$MT" --setup 2>&1)"; rc=$?
 check "it fails"                           [ "$rc" -ne 0 ]
 check "it names the checksum"              bash -c "printf '%s' \"\$1\" | grep -q 'Checksum mismatch'" _ "$out"
 check "nothing was installed"              bash -c "[ -z \"\$(ls -A '$T/bin' 2>/dev/null)\" ]"
