@@ -43,9 +43,15 @@ FILTER_REPO_SHA256="67447413e273fc76809289111748870b6f6072f08b17efe94863a92d810b
 FILTER_REPO_URL="${MIND_TRICK_FILTER_REPO_URL:-https://raw.githubusercontent.com/newren/git-filter-repo/v${FILTER_REPO_VERSION}/git-filter-repo}"
 BIN_DIR="${MIND_TRICK_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 # Searched even when it is not on the user's PATH, so a --setup install works
-# at once (and from a launcher whose PATH never had ~/.local/bin).
+# at once (and from a launcher whose PATH never had ~/.local/bin) - but LAST:
+# it is only there to find git-filter-repo, and first it would let a `git`
+# wrapper or shim in that folder outrank the user's own git, which is the git
+# that rewrites history and force-pushes (Kamino item 111).
 USER_PATH="$PATH"
-PATH="${BIN_DIR}:${PATH}"
+case ":${PATH}:" in
+    *":${BIN_DIR}:"*) ;;
+    *) PATH="${PATH}:${BIN_DIR}" ;;
+esac
 
 EXIT_NO_ENGINE=3                   # matches exist but nothing here can rewrite them
 
