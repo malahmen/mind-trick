@@ -73,7 +73,9 @@ That downloads filter-repo 2.47.0 (pinned), checks it against the sha256 of the
 file in that release's tarball, and puts it in `~/.local/bin` (or
 `$XDG_BIN_HOME`, or `$MIND_TRICK_BIN_DIR`). It needs `python3` and `curl`. A
 download that fails the checksum is deleted, not installed. mind-trick looks in
-that directory even when it is not on your `PATH`.
+that directory even when it is not on your `PATH` - after your own `PATH`,
+never before it, so a `git` wrapper or shim kept there cannot stand in for the
+git that rewrites your history and force-pushes it.
 
 It is checked for after the report and before anything is done. A dry run
 still lists what matches; a repo with nothing to scrub never needs it. A run
@@ -94,7 +96,7 @@ tests/run-all.sh
 MIND_TRICK=/path/to/mind-trick.sh tests/run-all.sh
 ```
 
-**29 checks.** No network: synthetic repositories and `file://` remotes. Because this tool
+**31 checks.** No network: synthetic repositories and `file://` remotes. Because this tool
 rewrites published history and force-pushes it, the suite asserts the
 properties that make that acceptable rather than only that it runs:
 
