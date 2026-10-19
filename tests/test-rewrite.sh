@@ -137,6 +137,20 @@ out="$(PATH="$T/have:/usr/bin:/bin" MIND_TRICK_FILTER_REPO_URL="file://$T/evil" 
 check "it succeeds without downloading"    [ "$rc" -eq 0 ]
 check "it says it is already installed"    bash -c "printf '%s' \"\$1\" | grep -q 'already installed'" _ "$out"
 
+echo "## 8. its bin dir is searched last: the user's git runs, filter-repo is still found"
+# A git in the bin dir (a wrapper, a shim) must not outrank the user's: that
+# git rewrites history and force-pushes.
+rm -rf "${T:?}/bin"; mkdir -p "$T/bin"
+printf '#!/bin/sh\necho "$*" >> "%s/shim-git.log"\nexec "%s" "$@"\n' "$T" "$REAL_GIT" > "$T/bin/git"; chmod +x "$T/bin/git"
+fixture "$T/f"
+out="$(PATH="$(dirname "$REAL_GIT"):/usr/bin:/bin" bash "$MT" --repo "$T/f" 2>&1)"
+check "the bin dir's git was never called"  [ ! -e "$T/shim-git.log" ]
+rm -f "$T/bin/git"
+# What the bin dir is for: a filter-repo there is found without being on PATH.
+printf '#!/bin/sh\necho a40bce548d2c\n' > "$T/bin/git-filter-repo"; chmod +x "$T/bin/git-filter-repo"
+out="$(PATH="/usr/bin:/bin" MIND_TRICK_FILTER_REPO_URL="file://$T/evil" bash "$MT" --setup 2>&1)"; rc=$?
+check "a filter-repo only in the bin dir is still found" bash -c "[ $rc -eq 0 ] && printf '%s' \"\$1\" | grep -q 'already installed'" _ "$out"
+
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi
 echo "all checks passed"
