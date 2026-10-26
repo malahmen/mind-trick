@@ -27,9 +27,16 @@ History rewriting is destructive, so mind-trick is conservative:
 - **Refuses shallow clones** (`--depth`) — neither rewrite engine can produce
   sound history from a truncated one. Run `git fetch --unshallow` first, or
   re-clone in full.
-- **Force-push is opt-in** (`--push`) — never automatic. Branches are pushed with
-  `--force-with-lease` against the sha `origin` had before the rewrite, so a
-  concurrent push is rejected instead of clobbered; tags are pushed with `--force`.
+- **Force-push is opt-in** (`--push`) — never automatic. It fetches `origin`
+  first and **refuses the whole run — nothing rewritten, nothing pushed — if a
+  local branch lacks commits its `origin/<branch>` has** (a teammate pushed and
+  you have not pulled): pushing it would erase their work. Pull, then re-run.
+  Refused rather than skipped, because the rewrite covers every local branch:
+  a skipped one would still be rewritten, and pulling into it afterwards would
+  bring every scrubbed commit back beside its rewritten twin.
+- Branches are then pushed with `--force-with-lease` against the sha that check
+  saw, so a push that lands on `origin` after it is rejected instead of
+  clobbered; tags are pushed with `--force`.
 - Content is untouched — only commit *messages* change (trees stay identical).
 
 ## What gets rewritten and pushed

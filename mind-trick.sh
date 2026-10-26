@@ -33,7 +33,7 @@ PATTERN='^Co-Authored-By: Claude'   # grep -iE, matched per message line
 APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
-ORIGIN_REFS=""                     # pre-rewrite '<sha> refs/remotes/origin/<b>' lines, for --force-with-lease
+ORIGIN_REFS=""                     # '<sha> refs/remotes/origin/<b>' lines as _check_push_safe checked them: the leases
 ENGINE=""                          # which rewriting tool _need_engine found
 
 # What --setup installs: one pinned filter-repo release, checked against the
@@ -79,7 +79,9 @@ Safe by default: without --apply it only reports. --apply always writes a git
 bundle backup first. It cannot remove commits GitHub keeps in refs/pull/*
 (merged-PR pages) — only branch history + the Contributors graph clear.
 
-Rewrites every local ref (branches, tags, origin/* tracking refs). --push sends
+Rewrites every local ref (branches, tags, origin/* tracking refs). --push first
+fetches origin and refuses the whole run (nothing rewritten, nothing pushed) if a
+local branch lacks commits its origin/<branch> has: pull first. It then sends
 the local branches that exist on origin, plus tags; other remotes and remote-only
 branches are untouched. Signatures on rewritten commits are dropped. Refuses a
 dirty tree (untracked files count) and shallow clones.
@@ -104,6 +106,42 @@ _report() {
     return 0
 }
 
+# _fetch_origin — what origin has NOW, before anything is decided about it.
+# Branches only (--no-tags): a fetched tag must not clobber a local one.
+_fetch_origin() {
+    _git remote get-url origin &>/dev/null || error_exit "--push needs a remote named 'origin' — nothing changed."
+    info "Fetching origin…"
+    _git fetch --no-tags --quiet origin >&2 || error_exit "Cannot fetch origin, so cannot check what --push would overwrite — nothing changed."
+}
+
+# _check_push_safe — refuse unless every branch --push would send contains
+# everything origin has on it (Kamino item 165). The lease alone stops only a
+# push made AFTER the last fetch: a branch fetched but not pulled
+# (origin/main=B, main=A) was leased on B, and the remote's "B A" became
+# "A'" - B surviving only in the backup bundle.
+#
+# The whole run is refused rather than the branch skipped: the rewrite covers
+# every local branch, so a skipped one would be rewritten here anyway, and
+# pulling origin into it afterwards would bring every scrubbed commit back
+# beside its rewritten twin. Refused before the backup, so nothing changes.
+#
+# The shas checked here are the leases _force_push uses: if origin moves
+# after this, the push is rejected.
+_check_push_safe() {
+    ORIGIN_REFS=$(_git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin)
+    local b o behind=()
+    while IFS= read -r b; do
+        [[ -z "$b" ]] && continue
+        o=$(printf '%s\n' "$ORIGIN_REFS" | awk -v r="refs/remotes/origin/$b" '$2 == r { print $1 }')
+        [[ -n "$o" ]] || continue
+        _git merge-base --is-ancestor "$o" "refs/heads/$b" || behind+=("$b")
+    done < <(_git for-each-ref --format='%(refname:short)' refs/heads)
+    (( ${#behind[@]} )) || return 0
+    local x
+    for x in "${behind[@]}"; do warn "  ${x}: origin/${x} has commits ${x} does not"; done
+    error_exit "Refusing --push: it would erase those commits from origin. Pull first (each branch above), then re-run — nothing changed."
+}
+
 _backup() {
     mkdir -p "$BACKUP_DIR"
     local name ts bundle
@@ -114,12 +152,9 @@ _backup() {
 }
 
 _rewrite() {
-    # Snapshotted BEFORE the rewrite, because both engines destroy it:
-    # filter-branch rewrites refs/remotes/origin/* too, and filter-repo
-    # deletes the remotes outright. These shas are the --force-with-lease
-    # expectations later.
-    ORIGIN_REFS=$(_git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin)
-
+    # origin's shas (the leases) were taken by _check_push_safe, before this:
+    # both engines destroy them - filter-branch rewrites refs/remotes/origin/*
+    # too, and filter-repo deletes the remotes outright.
     case "$ENGINE" in
         filter-branch) _rewrite_filter_branch ;;
         filter-repo)   _rewrite_filter_repo ;;
@@ -293,8 +328,10 @@ main() {
     REPO="${REPO/#\~/$HOME}"
 
     _preflight
+    [[ "$PUSH" != true ]] || _fetch_origin
     _report || exit 0
     _need_engine
+    [[ "$PUSH" != true ]] || _check_push_safe
     if [[ "$APPLY" != true ]]; then
         info "Dry run — re-run with --apply to rewrite (and --push to force-push)."
         exit 0
@@ -303,7 +340,7 @@ main() {
     _rewrite
     success "History cleaned locally."
     if [[ "$PUSH" == true ]]; then _force_push
-    else info "Not pushed. Use --push, or: cd $REPO && git push --force origin <branch> --tags"; fi
+    else info "Not pushed. --apply --push together first checks that origin has nothing you lack; by hand, only if you pulled before --apply: cd $REPO && git push --force-with-lease origin <branch>"; fi
 }
 
 main "$@"

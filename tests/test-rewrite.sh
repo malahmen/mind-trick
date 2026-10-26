@@ -42,6 +42,35 @@ NOGIT
 chmod +x "$T/no-engine/git"
 NO_ENGINE_PATH="$T/no-engine:/usr/bin:/bin"
 
+# The two engines rewrite differently (filter-repo deletes the remotes and
+# turns origin's branches into local ones; filter-branch rewrites the
+# tracking refs), so every case that rewrites runs once per engine this
+# machine has. filter-repo is preferred where both exist; a git that refuses
+# only filter-repo forces filter-branch.
+mkdir -p "$T/only-fb"
+cat > "$T/only-fb/git" <<FBGIT
+#!/bin/sh
+[ "\$1" = filter-repo ] && { echo "git: 'filter-repo' is not a git command. See 'git --help'." >&2; exit 1; }
+exec "$REAL_GIT" "\$@"
+FBGIT
+chmod +x "$T/only-fb/git"
+ENGINES=()
+git filter-repo --version >/dev/null 2>&1 && ENGINES+=(filter-repo)
+case "$(PATH="$T/only-fb:$PATH" git filter-branch -h 2>&1)" in
+    *"is not a git command"*) ;;
+    *) ENGINES+=(filter-branch) ;;
+esac
+for e in filter-repo filter-branch; do
+    case " ${ENGINES[*]} " in *" $e "*) ;; *) echo "   skip - no $e here: its cases do not run" ;; esac
+done
+# mt ENGINE ARGS… — run the tool with that engine; output in $out, status in $rc.
+mt() {
+    local e="$1"; shift
+    if [ "$e" = filter-branch ]; then out="$(PATH="$T/only-fb:$PATH" bash "$MT" "$@" 2>&1)"; rc=$?
+    else out="$(bash "$MT" "$@" 2>&1)"; rc=$?; fi
+}
+has() { printf '%s' "$out" | grep -q -e "$1"; }
+
 FAILS=0
 check() { local d="$1"; shift; if "$@"; then echo "   ok   - $d"; else echo "   FAIL - $d"; FAILS=$((FAILS + 1)); fi; }
 trailers() { git -C "$1" log "${2:-master}" --format='%(trailers:key=Co-Authored-By)' | grep -c . || true; }
@@ -77,30 +106,69 @@ check "it names the engine"               bash -c "printf '%s' \"\$1\" | grep -q
 check "nothing was rewritten"             [ "$(git -C "$T/a" rev-parse master)" = "$before_sha" ]
 check "no backup was written"             bash -c "[ ! -d '$T/cache/mind-trick' ] || [ -z \"\$(ls -A '$T/cache/mind-trick')\" ]"
 
-echo "## 2. --apply --push removes them, locally and on the remote"
-fixture "$T/b"
-tree_before="$(git -C "$T/b" rev-parse 'master^{tree}')"
-count_before="$(git -C "$T/b" rev-list --count master)"
-bash "$MT" --repo "$T/b" --apply --push >/dev/null 2>&1
-check "local trailers are gone"            [ "$(trailers "$T/b")" = 0 ]
-check "remote trailers are gone"           [ "$(trailers "$T/b-origin.git")" = 0 ]
-check "file content is untouched"          [ "$(git -C "$T/b" rev-parse 'master^{tree}')" = "$tree_before" ]
-check "no commits were lost"               [ "$(git -C "$T/b" rev-list --count master)" = "$count_before" ]
-check "the other trailer survived"         bash -c "git -C '$T/b' log --format=%B | grep -q 'Reviewed-by: someone'"
-check "the remote was restored"            bash -c "git -C '$T/b' remote | grep -qx origin"
-check "a backup bundle exists"             bash -c "ls '$T/cache/mind-trick'/*.bundle >/dev/null 2>&1"
+for E in "${ENGINES[@]}"; do
+echo "## 2. [$E] --apply --push removes them, locally and on the remote"
+fixture "$T/b-$E"
+tree_before="$(git -C "$T/b-$E" rev-parse 'master^{tree}')"
+count_before="$(git -C "$T/b-$E" rev-list --count master)"
+mt "$E" --repo "$T/b-$E" --apply --push
+check "it ran with $E"                     has "Rewrite engine: $E"
+check "local trailers are gone"            [ "$(trailers "$T/b-$E")" = 0 ]
+check "remote trailers are gone"           [ "$(trailers "$T/b-$E-origin.git")" = 0 ]
+check "file content is untouched"          [ "$(git -C "$T/b-$E" rev-parse 'master^{tree}')" = "$tree_before" ]
+check "no commits were lost"               [ "$(git -C "$T/b-$E" rev-list --count master)" = "$count_before" ]
+check "the other trailer survived"         bash -c "git -C '$T/b-$E' log --format=%B | grep -q 'Reviewed-by: someone'"
+check "the remote was restored"            bash -c "git -C '$T/b-$E' remote | grep -qx origin"
+check "a backup bundle exists"             bash -c "ls '$T/cache/mind-trick'/b-$E-*.bundle >/dev/null 2>&1"
 check "the backup still has the trailers"  bash -c '
-    b=$(ls "$1"/cache/mind-trick/*.bundle | head -1); d=$(mktemp -d)
-    git clone -q "$b" "$d/r" && [ "$(git -C "$d/r" log --format="%(trailers:key=Co-Authored-By)" | grep -c .)" = 3 ]' _ "$T"
+    b=$(ls "$1"/cache/mind-trick/b-"$2"-*.bundle | head -1); d=$(mktemp -d)
+    git clone -q "$b" "$d/r" && [ "$(git -C "$d/r" log --format="%(trailers:key=Co-Authored-By)" | grep -c .)" = 3 ]' _ "$T" "$E"
 
-echo "## 3. a remote that moved is refused, not overwritten"
-fixture "$T/c"
-git clone -q "$T/c-origin.git" "$T/c-other"
-git -C "$T/c-other" commit -q --allow-empty -m "a teammate pushed this"
-git -C "$T/c-other" push -q origin master
-bash "$MT" --repo "$T/c" --apply --push >/dev/null 2>&1
-check "the teammate's commit survived"     bash -c "git -C '$T/c-origin.git' log -1 --format=%s master | grep -q 'a teammate pushed this'"
-check "the remote still has its trailers"  [ "$(trailers "$T/c-origin.git")" = 3 ]
+echo "## 3. [$E] a remote that moved after the fetch is refused, not overwritten"
+# The teammate pushes between mind-trick's own fetch and its push: the git
+# below fires once, on the first push, so only the lease can stop it.
+fixture "$T/c-$E"
+git clone -q "$T/c-$E-origin.git" "$T/c-$E-other"
+git -C "$T/c-$E-other" commit -q --allow-empty -m "a teammate pushed this"
+mkdir -p "$T/c-$E-race"
+cat > "$T/c-$E-race/git" <<RACE
+#!/bin/sh
+[ "\$1" = filter-repo ] && [ "$E" = filter-branch ] && { echo "git: 'filter-repo' is not a git command." >&2; exit 1; }
+if [ "\$3" = push ] && [ ! -e "$T/c-$E-race/done" ]; then
+    : > "$T/c-$E-race/done"; "$REAL_GIT" -C "$T/c-$E-other" push -q origin master
+fi
+exec "$REAL_GIT" "\$@"
+RACE
+chmod +x "$T/c-$E-race/git"
+out="$(PATH="$T/c-$E-race:$PATH" bash "$MT" --repo "$T/c-$E" --apply --push 2>&1)"
+check "it ran with $E"                     has "Rewrite engine: $E"
+check "the race fired"                     [ -e "$T/c-$E-race/done" ]
+check "the teammate's commit survived"     bash -c "git -C '$T/c-$E-origin.git' log -1 --format=%s master | grep -q 'a teammate pushed this'"
+check "the remote still has its trailers"  [ "$(trailers "$T/c-$E-origin.git")" = 3 ]
+
+echo "## 9. [$E] a branch behind origin: refused before anything changes (Kamino 165)"
+# A teammate pushed B; this clone has only A on main. Fetched-not-pulled, and
+# not fetched at all: both used to end with origin's main replaced by A'.
+for how in fetched unfetched; do
+    w="$T/i-$E-$how"; git init -q --bare -b master "$w-origin.git"
+    git clone -q "$w-origin.git" "$w-mate" 2>/dev/null
+    echo A > "$w-mate/f"; git -C "$w-mate" add f
+    git -C "$w-mate" commit -q -m A -m "Co-Authored-By: Claude <noreply@anthropic.com>"
+    git -C "$w-mate" push -q origin master
+    git clone -q "$w-origin.git" "$w"
+    echo B >> "$w-mate/f"; git -C "$w-mate" commit -q -am B -m "Co-Authored-By: Claude <noreply@anthropic.com>"
+    git -C "$w-mate" push -q origin master
+    [ "$how" = fetched ] && git -C "$w" fetch -q origin
+    remote_before="$(git -C "$w-origin.git" rev-parse master)"; local_before="$(git -C "$w" rev-parse master)"
+    mt "$E" --repo "$w" --apply --push
+    check "[$how] it is refused"                 [ "$rc" -ne 0 ]
+    check "[$how] it says to pull first"         has "Pull first"
+    check "[$how] it names the branch"           has "master: origin/master has commits"
+    check "[$how] origin's master is untouched"  [ "$(git -C "$w-origin.git" rev-parse master)" = "$remote_before" ]
+    check "[$how] the local branch is untouched" [ "$(git -C "$w" rev-parse master)" = "$local_before" ]
+    check "[$how] no backup: nothing started"    bash -c "! ls '$T/cache/mind-trick'/i-$E-$how-*.bundle >/dev/null 2>&1"
+done
+done
 
 echo "## 4. no engine: refuse before the backup"
 fixture "$T/d"
