@@ -168,6 +168,76 @@ for how in fetched unfetched; do
     check "[$how] the local branch is untouched" [ "$(git -C "$w" rev-parse master)" = "$local_before" ]
     check "[$how] no backup: nothing started"    bash -c "! ls '$T/cache/mind-trick'/i-$E-$how-*.bundle >/dev/null 2>&1"
 done
+
+echo "## 10. [$E] a branch only on origin is neither pushed nor left behind (Kamino 171)"
+# filter-repo turned origin/feat into a local feat, which --push then scrubbed
+# and force-pushed; README and --help promise remote-only branches untouched.
+w="$T/j-$E"; fixture "$w"
+git clone -q "$w-origin.git" "$w-mate"
+git -C "$w-mate" checkout -q -b feat
+git -C "$w-mate" commit -q --allow-empty -m "feat work" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
+git -C "$w-mate" push -q origin feat
+git -C "$w" fetch -q origin
+feat_before="$(git -C "$w-origin.git" rev-parse feat)"
+mt "$E" --repo "$w" --apply --push
+check "it succeeds"                          [ "$rc" -eq 0 ]
+check "origin's master was scrubbed"         [ "$(trailers "$w-origin.git")" = 0 ]
+check "origin's feat is untouched"           [ "$(git -C "$w-origin.git" rev-parse feat)" = "$feat_before" ]
+check "no local feat was left behind"        bash -c "! git -C '$w' rev-parse -q --verify refs/heads/feat >/dev/null"
+
+echo "## 11. [$E] what the report shows is what is rewritten (Kamino 171)"
+# The report used git's regex, filter-repo Python's re. Whatever this grep
+# makes of a pattern, a run either removes exactly what it reported or
+# refuses with nothing changed.
+w="$T/k-$E"; fixture "$w"
+m_before="$(git -C "$w" rev-parse master)"; r_before="$(git -C "$w-origin.git" rev-parse master)"
+mt "$E" --repo "$w" --pattern '^Co-Authored-By:[[:space:]]+Claude' --apply --push
+if [ "$rc" -eq 0 ]; then
+    check "[[:space:]] reported 3 and removed them, locally"  bash -c "printf '%s' \"\$1\" | grep -q '3 commit(s) contain' && [ \"\$(git -C \"\$2\" log --format='%(trailers:key=Co-Authored-By)' master | grep -c .)\" = 0 ]" _ "$out" "$w"
+    check "[[:space:]] and on origin"        [ "$(trailers "$w-origin.git")" = 0 ]
+else
+    check "[[:space:]] refused: says nothing changed" has "nothing changed"
+    check "[[:space:]] refused: master untouched"     [ "$(git -C "$w" rev-parse master)" = "$m_before" ]
+    check "[[:space:]] refused: origin untouched"     [ "$(git -C "$w-origin.git" rev-parse master)" = "$r_before" ]
+fi
+check "[[:space:]] never 'cleaned' with matches left" bash -c "! { printf '%s' \"\$1\" | grep -q 'History cleaned' && [ \"\$(git -C \"\$2\" log --format='%(trailers:key=Co-Authored-By)' master | grep -c .)\" != 0 ]; }" _ "$out" "$w"
+[ "$E" = filter-repo ] && check "[[:space:]] filter-repo: refused, not half-done" [ "$rc" -ne 0 ]
+
+w="$T/l-$E"; fixture "$w"
+git -C "$w" commit -q --allow-empty -m "ref forty-two" -m "Ref: 42"
+git -C "$w" commit -q --allow-empty -m "ref dee" -m "Ref: d"
+git -C "$w" push -q origin master
+m_before="$(git -C "$w" rev-parse master)"
+mt "$E" --repo "$w" --pattern '^Ref: \d' --apply --push
+for x in "42:forty-two" "d:dee"; do
+    v="${x%%:*}"; subj="ref ${x#*:}"
+    check "\\d: 'Ref: $v' is kept, or it was reported" bash -c "git -C \"\$2\" log --format=%B master | grep -qx 'Ref: $v' || printf '%s' \"\$1\" | grep -q '| $subj\$'" _ "$out" "$w"
+done
+[ "$rc" -eq 0 ] || check "\\d refused: master untouched" [ "$(git -C "$w" rev-parse master)" = "$m_before" ]
+
+echo "## 12. [$E] a rewrite that is not what was reported is never pushed (Kamino 171)"
+# The last check before a force-push: an engine that also drops a line the
+# pattern does not match (Reviewed-by) must stop the run, origin untouched.
+w="$T/m-$E"; fixture "$w"; mkdir -p "$w-bad"
+cat > "$w-bad/git" <<BAD
+#!/bin/sh
+[ "\$1" = filter-repo ] && [ "$E" = filter-branch ] && { echo "git: 'filter-repo' is not a git command." >&2; exit 1; }
+case "\$3" in
+    filter-repo) exec "$REAL_GIT" -C "\$2" filter-repo --force --message-callback '
+return b"\\n".join(l for l in message.split(b"\\n") if not l.lower().startswith((b"co-authored-by", b"reviewed-by")))' ;;
+    filter-branch) FILTER_BRANCH_SQUELCH_WARNING=1 exec "$REAL_GIT" -C "\$2" filter-branch -f --msg-filter "sed -e '/^Reviewed-by/d' -e '/^Co-Authored-By/d'" --tag-name-filter cat -- --all ;;
+esac
+exec "$REAL_GIT" "\$@"
+BAD
+chmod +x "$w-bad/git"
+r_before="$(git -C "$w-origin.git" rev-parse master)"
+out="$(PATH="$w-bad:$PATH" bash "$MT" --repo "$w" --apply --push 2>&1)"; rc=$?
+check "it ran with $E"                       has "Rewrite engine: $E"
+check "it fails"                             [ "$rc" -ne 0 ]
+check "it names what went wrong"             has "lines that do not match"
+check "it says nothing was pushed"           has "NOTHING was pushed"
+check "it says how to restore"               has "git clone .*\\.bundle"
+check "origin is untouched"                  [ "$(git -C "$w-origin.git" rev-parse master)" = "$r_before" ]
 done
 
 echo "## 4. no engine: refuse before the backup"

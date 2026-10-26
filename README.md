@@ -37,6 +37,17 @@ History rewriting is destructive, so mind-trick is conservative:
 - Branches are then pushed with `--force-with-lease` against the sha that check
   saw, so a push that lands on `origin` after it is rejected instead of
   clobbered; tags are pushed with `--force`.
+- **What is shown is what is rewritten.** The report reads every message line
+  with `grep -iE`, and filter-branch's filter runs that same `grep`. filter-repo
+  rewrites with Python's `re`, a different dialect, so before anything is done
+  every message line in the history is tested with both, and a pattern they
+  read differently is refused, nothing changed (`[[:space:]]` is a class to
+  grep and a set to Python; `\d` is a digit to Python and, to GNU grep, a `d`).
+  Write it in the syntax both share: `[ ]` or a space, `[0-9]`.
+- **Checked before any push:** after the rewrite, the branches and tags must
+  hold as many commits as before, no line that matches, and no line gone that
+  did not match. Otherwise nothing is pushed and the run says to restore from
+  the backup.
 - Content is untouched — only commit *messages* change (trees stay identical).
 
 ## What gets rewritten and pushed
@@ -44,10 +55,14 @@ History rewriting is destructive, so mind-trick is conservative:
 - **Rewritten locally:** every ref in the repository — all local branches, all
   tags (annotated tags are re-created pointing at the rewritten commits) and the
   `origin/*` remote-tracking refs.
-- **Pushed with `--push`:** every local branch that has an `origin/<branch>`
-  counterpart (branches without one are skipped with a note), then all tags.
+- **Pushed with `--push`:** every local branch that existed before the rewrite
+  and has an `origin/<branch>` counterpart (branches without one are skipped
+  with a note), then all tags.
 - **Untouched:** other remotes, and branches that exist only on the remote (no
-  local branch) — check them out first if they need scrubbing.
+  local branch) — check them out first if they need scrubbing. filter-repo
+  turns `origin/<branch>` into a local branch when none exists; mind-trick
+  deletes those again, so with either engine they are neither pushed nor left
+  behind.
 - **Signatures are stripped:** a rewritten commit is a new object, so GPG/SSH
   signatures on rewritten commits (and on signed tags) do not survive. Re-sign
   afterwards if you need them.
@@ -166,7 +181,7 @@ chmod +x mind-trick.sh
 | Flag | Meaning |
 | ---- | ------- |
 | `--repo DIR` | repository to operate on (default: current directory) |
-| `--pattern REGEX` | message lines to remove, `grep -iE` (default `^Co-Authored-By: Claude`) |
+| `--pattern REGEX` | message lines to remove, `grep -iE` (default `^Co-Authored-By: Claude`); under filter-repo, a pattern Python's `re` reads differently on this history is refused |
 | `--apply` | actually rewrite history (default: dry-run) |
 | `--push` | force-push the rewritten branches and tags after `--apply` |
 | `--setup` | install `git filter-repo` (pinned, checksum-verified) into `~/.local/bin` |
