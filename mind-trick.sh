@@ -33,8 +33,13 @@ PATTERN='^Co-Authored-By: Claude'   # grep -iE, matched per message line
 APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
-ORIGIN_REFS=""                     # pre-rewrite '<sha> refs/remotes/origin/<b>' lines, for --force-with-lease
+ORIGIN_REFS=""                     # '<sha> refs/remotes/origin/<b>' lines as _check_push_safe checked them: the leases
+REMOTE_TAGS=""                     # '<sha> refs/tags/<t>' lines origin had before the rewrite (ls-remote)
+HEADS_BEFORE=""                    # '<sha> refs/heads/<b>' lines before the rewrite: the only branches ever pushed
+TAGS_BEFORE=""                     # '<sha> refs/tags/<t>' lines before the rewrite
 ENGINE=""                          # which rewriting tool _need_engine found
+WORK=""                            # scratch dir for the message dumps, removed on exit
+BUNDLE=""                          # the backup _backup wrote
 
 # What --setup installs: one pinned filter-repo release, checked against the
 # sha256 of the file in its release tarball, into a user dir (no root, no pip).
@@ -55,6 +60,11 @@ esac
 
 EXIT_NO_ENGINE=3                   # matches exist but nothing here can rewrite them
 
+# The grep that defines what --pattern means: the report, the post-rewrite
+# check and filter-branch's message filter all run THIS binary, by absolute
+# path (the filter runs under a fixed PATH, where another grep could differ).
+GREP="$(command -v grep)"
+
 usage() {
     cat >&2 <<'EOF'
 mind-trick — scrub commit-message trailers from git history
@@ -65,7 +75,9 @@ USAGE
 
 FLAGS
   --repo DIR       repository to operate on (default: current directory)
-  --pattern REGEX  message lines to remove, grep -iE (default '^Co-Authored-By: Claude')
+  --pattern REGEX  message lines to remove, grep -iE (default '^Co-Authored-By: Claude').
+                   filter-repo rewrites with Python's re: a pattern the two
+                   read differently on this history is refused.
   --apply          actually rewrite history (default: dry-run only)
   --push           force-push the rewritten branches and tags after --apply
   --setup          install git filter-repo (pinned, checksum-verified) into
@@ -79,29 +91,131 @@ Safe by default: without --apply it only reports. --apply always writes a git
 bundle backup first. It cannot remove commits GitHub keeps in refs/pull/*
 (merged-PR pages) — only branch history + the Contributors graph clear.
 
-Rewrites every local ref (branches, tags, origin/* tracking refs). --push sends
-the local branches that exist on origin, plus tags; other remotes and remote-only
-branches are untouched. Signatures on rewritten commits are dropped. Refuses a
-dirty tree (untracked files count) and shallow clones.
+Rewrites every local ref (branches, tags, origin/* tracking refs). --push first
+fetches origin and refuses the whole run (nothing rewritten, nothing pushed) if a
+local branch lacks commits its origin/<branch> has: pull first. It then sends
+the local branches that existed before the rewrite and exist on origin, and
+the tags the rewrite changed that origin has as they were here, each with a
+lease; other remotes, remote-only branches, local-only tags and tags origin
+has differently are untouched. Nothing is pushed unless the rewritten history
+has no matching line left and lost only matching lines. Signatures on
+rewritten commits are dropped. Refuses a dirty tree (untracked files count), a
+shallow clone, and a rebase, merge, cherry-pick, revert or bisect in progress.
 EOF
 }
 
 _git() { git -C "$REPO" "$@"; }
-_matching_commits() { _git log --all -i -E --grep="$PATTERN" --format='%H'; }
+
+# _messages OUT REV… — every message line of every commit reachable from REV…,
+# one per line, into OUT, and the commit each line belongs to, line for line,
+# into OUT.c. The report, the dialect check and the post-rewrite check all
+# read these files, so they judge the same lines with the same grep.
+_messages() {
+    local out="$1"; shift
+    : > "$out"; : > "${out}.c"
+    _git log --format='%x01%H%n%B' "$@" | awk -v l="$out" -v c="${out}.c" '
+        substr($0, 1, 1) == "\001" { h = substr($0, 2); next }
+        { print $0 > l; print h > c }'
+}
+
+# _grep_lines FILE — the numbers of FILE's lines that --pattern matches.
+_grep_lines() {
+    local rc=0
+    "$GREP" -n -i -E -e "$PATTERN" "$1" > "${1}.m" || rc=$?
+    (( rc <= 1 )) || error_exit "grep cannot use --pattern '$PATTERN' — nothing changed."
+    cut -d: -f1 "${1}.m"
+}
 
 _report() {
-    local n; n=$(_matching_commits | wc -l | tr -d ' ')
+    _messages "$WORK/all" --all
+    _grep_lines "$WORK/all" > "$WORK/all.lines"
+    # The matching commits: the commit of each matching line, once.
+    awk 'NR == FNR { m[$1]; next } FNR in m' "$WORK/all.lines" "$WORK/all.c" | sort -u > "$WORK/all.commits"
+    local n; n=$(wc -l < "$WORK/all.commits" | tr -d ' ')
     if [[ "$n" -eq 0 ]]; then success "No commits match /$PATTERN/ — nothing to do."; return 1; fi
     warn "${n} commit(s) contain a line matching /$PATTERN/:"
-    _git log --all -n 20 -i -E --grep="$PATTERN" --format='  %h %an | %s' >&2   # -n, not | head: no SIGPIPE under pipefail
+    # Not -n 20: with it, git (2.39 and 2.43 at least) walks despite
+    # --no-walk, and the list showed the matching commits' ancestors too.
+    # awk, not head: it reads to the end, so no SIGPIPE under pipefail.
+    _git log --no-walk --stdin --format='  %h %an | %s' < "$WORK/all.commits" | awk 'NR <= 20' >&2
     (( n > 20 )) && info "  … and $((n - 20)) more"
     info "Affected branches:"
-    local b
+    local b hits
     while IFS= read -r b; do
         [[ -z "$b" ]] && continue
-        [[ -n "$(_git log "$b" -n 1 -i -E --grep="$PATTERN" --format='%H')" ]] && printf '    %s\n' "$b" >&2
+        # Counted, not grep -q: an early exit would SIGPIPE rev-list under pipefail.
+        hits=$(_git rev-list "$b" | "$GREP" -c -F -x -f "$WORK/all.commits" || true)
+        [[ "${hits:-0}" -gt 0 ]] && printf '    %s\n' "$b" >&2
     done < <(_git for-each-ref --format='%(refname:short)' refs/heads)
     return 0
+}
+
+# _check_dialects — refuse a pattern that grep -E (the report) and Python's re
+# (filter-repo's rewrite) read differently on THIS history (Kamino item 171).
+# '^Co-Authored-By:[[:space:]]+Claude' is a POSIX class to grep and a set to
+# Python: the report listed matches the rewrite kept, then said "History
+# cleaned". '^Ref: \d' is a digit to Python and a 'd' to grep: the rewrite
+# removed lines the report never showed. Every message line is tested with
+# both, so the check is exact for the history about to be rewritten.
+_check_dialects() {
+    [[ "$ENGINE" == filter-repo ]] || return 0   # filter-branch filters with the report's own grep
+    MT_PATTERN="$PATTERN" python3 -c '
+import os, re, sys
+rx = re.compile(os.environ["MT_PATTERN"].encode(), re.IGNORECASE)
+with open(sys.argv[1], "rb") as f:
+    for i, l in enumerate(f.read().split(b"\n")[:-1], 1):
+        if rx.search(l): print(i)
+' "$WORK/all" > "$WORK/all.py" 2>/dev/null \
+        || error_exit "Python's re cannot compile --pattern '$PATTERN' (filter-repo's rewrite uses it) — nothing changed."
+    cmp -s "$WORK/all.lines" "$WORK/all.py" && return 0
+    warn "--pattern '$PATTERN' means different things to grep -E (the report)"
+    warn "and to Python's re (filter-repo's rewrite) on these message lines:"
+    local n
+    while IFS= read -r n; do printf '    grep only:   %s\n' "$(sed -n "${n}p" "$WORK/all")" >&2
+    done < <(comm -23 <(sort "$WORK/all.lines") <(sort "$WORK/all.py") | sort -n | head -n 5)
+    while IFS= read -r n; do printf '    Python only: %s\n' "$(sed -n "${n}p" "$WORK/all")" >&2
+    done < <(comm -13 <(sort "$WORK/all.lines") <(sort "$WORK/all.py") | sort -n | head -n 5)
+    error_exit "Refusing: what is shown must be what is rewritten. Write it so both read it alike ('[ ]' or ' ', not [[:space:]] or \\s; [0-9], not \\d) — nothing changed."
+}
+
+# _fetch_origin — what origin has NOW, before anything is decided about it.
+# Branches only (--no-tags): a fetched tag must not clobber a local one.
+# origin's tags are listed instead: each tag push is leased on them.
+_fetch_origin() {
+    _git remote get-url origin &>/dev/null || error_exit "--push needs a remote named 'origin' — nothing changed."
+    info "Fetching origin…"
+    _git fetch --no-tags --quiet origin >&2 || error_exit "Cannot fetch origin, so cannot check what --push would overwrite — nothing changed."
+    local tags
+    tags=$(_git ls-remote --tags origin) || error_exit "Cannot list origin's tags — nothing changed."
+    REMOTE_TAGS=$(printf '%s\n' "$tags" | awk '$2 !~ /\^\{\}$/')
+}
+
+# _check_push_safe — refuse unless every branch --push would send contains
+# everything origin has on it (Kamino item 165). The lease alone stops only a
+# push made AFTER the last fetch: a branch fetched but not pulled
+# (origin/main=B, main=A) was leased on B, and the remote's "B A" became
+# "A'" - B surviving only in the backup bundle.
+#
+# The whole run is refused rather than the branch skipped: the rewrite covers
+# every local branch, so a skipped one would be rewritten here anyway, and
+# pulling origin into it afterwards would bring every scrubbed commit back
+# beside its rewritten twin. Refused before the backup, so nothing changes.
+#
+# The shas checked here are the leases _force_push uses: if origin moves
+# after this, the push is rejected.
+_check_push_safe() {
+    ORIGIN_REFS=$(_git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin)
+    local b o behind=()
+    while IFS= read -r b; do
+        [[ -z "$b" ]] && continue
+        o=$(printf '%s\n' "$ORIGIN_REFS" | awk -v r="refs/remotes/origin/$b" '$2 == r { print $1 }')
+        [[ -n "$o" ]] || continue
+        _git merge-base --is-ancestor "$o" "refs/heads/$b" || behind+=("$b")
+    done < <(_git for-each-ref --format='%(refname:short)' refs/heads)
+    (( ${#behind[@]} )) || return 0
+    local x
+    for x in "${behind[@]}"; do warn "  ${x}: origin/${x} has commits ${x} does not"; done
+    error_exit "Refusing --push: it would erase those commits from origin. Pull first (each branch above), then re-run — nothing changed."
 }
 
 _backup() {
@@ -110,15 +224,23 @@ _backup() {
     name=$(basename "$(cd "$REPO" && pwd)")
     ts=$(date +%Y%m%d-%H%M%S)
     bundle="${BACKUP_DIR}/${name}-${ts}.bundle"
-    _git bundle create "$bundle" --all >&2 && success "Backup: $bundle (restore: git clone $bundle)"
+    _git bundle create "$bundle" --all >&2 || error_exit "Backup failed — nothing changed."
+    BUNDLE="$bundle"
+    success "Backup: $bundle (restore: git clone $bundle)"
 }
 
 _rewrite() {
-    # Snapshotted BEFORE the rewrite, because both engines destroy it:
-    # filter-branch rewrites refs/remotes/origin/* too, and filter-repo
-    # deletes the remotes outright. These shas are the --force-with-lease
-    # expectations later.
-    ORIGIN_REFS=$(_git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin)
+    # origin's shas (the leases) were taken by _check_push_safe, before this:
+    # both engines destroy them - filter-branch rewrites refs/remotes/origin/*
+    # too, and filter-repo deletes the remotes outright.
+    #
+    # Snapshotted here, before the rewrite: the branches that exist now are
+    # the only ones ever pushed, and the messages are what the result is
+    # checked against.
+    HEADS_BEFORE=$(_git for-each-ref --format='%(objectname) %(refname)' refs/heads)
+    TAGS_BEFORE=$(_git for-each-ref --format='%(objectname) %(refname)' refs/tags)
+    _messages "$WORK/before" --branches --tags
+    local commits_before; commits_before=$(_git rev-list --count --branches --tags)
 
     case "$ENGINE" in
         filter-branch) _rewrite_filter_branch ;;
@@ -126,25 +248,71 @@ _rewrite() {
         *)             error_exit "No rewrite engine selected — _need_engine should have caught this." ;;
     esac
 
+    # filter-repo turns refs/remotes/origin/<b> into refs/heads/<b> where no
+    # local <b> exists. Those are remote-only branches, which this tool leaves
+    # alone and filter-branch never creates: dropped, so neither engine leaves
+    # one behind (Kamino item 171). origin and the backup have the originals.
+    local r
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        printf '%s\n' "$HEADS_BEFORE" | awk -v r="$r" '$2 == r { f = 1 } END { exit !f }' && continue
+        _git update-ref -d "$r"
+        info "dropped ${r#refs/heads/}: filter-repo made it from origin's branch; remote-only branches are left alone"
+    done < <(_git for-each-ref --format='%(refname)' refs/heads)
+
     _git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while read -r r; do _git update-ref -d "$r"; done
     _git reflog expire --expire=now --all 2>/dev/null || true
     _git gc --prune=now --quiet 2>/dev/null || true
+
+    _verify_rewrite "$commits_before"
+}
+
+# _verify_rewrite N — the rewritten branches and tags hold N commits, no line
+# that matches, no line that was not there, and every line that is gone
+# matched (blank lines aside: the engines differ on trailing ones). The same
+# grep and files as the report, so what was shown is what was rewritten; if
+# not, stop before any push.
+_verify_rewrite() {
+    local commits_after problem=""
+    commits_after=$(_git rev-list --count --branches --tags)
+    _messages "$WORK/after" --branches --tags
+    if [[ "$commits_after" != "$1" ]]; then
+        problem="the branches and tags held $1 commits and now hold ${commits_after}"
+    elif [[ -n "$(_grep_lines "$WORK/after")" ]]; then
+        problem="lines matching /$PATTERN/ are still there"
+    else
+        { "$GREP" -v -x -E -e '[[:space:]]*' "$WORK/before" || true; } | LC_ALL=C sort > "$WORK/before.s"
+        { "$GREP" -v -x -E -e '[[:space:]]*' "$WORK/after"  || true; } | LC_ALL=C sort > "$WORK/after.s"
+        LC_ALL=C comm -23 "$WORK/before.s" "$WORK/after.s" > "$WORK/removed"
+        if [[ -n "$(LC_ALL=C comm -13 "$WORK/before.s" "$WORK/after.s")" ]]; then
+            problem="lines that were never there appeared"
+        elif [[ -n "$("$GREP" -v -i -E -e "$PATTERN" "$WORK/removed" || true)" ]]; then
+            problem="lines that do not match /$PATTERN/ were removed"
+        fi
+    fi
+    [[ -n "$problem" ]] || return 0
+    error_exit "The rewrite does not match the report: ${problem}. NOTHING was pushed. Restore this repository from the backup: git clone ${BUNDLE}"
 }
 
 _rewrite_filter_branch() {
-    local helper esc; helper=$(mktemp)
-    esc=$(printf '%s' "$PATTERN" | sed "s/'/'\\\\''/g")   # single-quote-safe
+    local helper="$WORK/msg-filter.sh" esc
+    # The report's own grep, by path (single-quote-safe); the pattern comes
+    # through the environment, not the filter's source.
+    esc=$(printf '%s' "$GREP" | sed "s/'/'\\\\''/g")
     cat > "$helper" <<EOF
 #!/usr/bin/env bash
 export PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
 msg="\$(cat)"
-msg="\$(printf '%s\n' "\$msg" | grep -v -iE '${esc}' || true)"
+msg="\$(printf '%s\n' "\$msg" | '${esc}' -v -i -E -e "\$MT_PATTERN" || true)"
 printf '%s\n' "\$msg"
 EOF
-    FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
-    local rc=$?
+    # In an `if`: under set -e a bare failing command ended the script right
+    # here, leaving the helper behind and saying nothing about the push.
+    if ! MT_PATTERN="$PATTERN" FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash $(printf '%q' "$helper")" --tag-name-filter cat -- --all >&2; then
+        rm -f "$helper"
+        error_exit "filter-branch failed — nothing pushed. If the repository looks wrong, restore it from the backup: git clone ${BUNDLE}"
+    fi
     rm -f "$helper"
-    [[ $rc -eq 0 ]] || error_exit "filter-branch failed — nothing pushed."
 }
 
 _rewrite_filter_repo() {
@@ -164,9 +332,9 @@ _rewrite_filter_repo() {
     # interpolated into the callback source: it is user-supplied, and a
     # --pattern containing a quote would otherwise be executable code.
     #
-    # grep -iE and Python's re agree on the patterns this tool is for (a
-    # trailer key anchored with ^); they are not the same dialect, so an
-    # exotic ERE could behave differently between the two engines.
+    # grep -iE (the report) and Python's re are not the same dialect:
+    # _check_dialects refused a pattern they read differently on this
+    # history, and _verify_rewrite checks the result before any push.
     MT_PATTERN="$PATTERN" _git filter-repo --force --message-callback '
 import os, re
 _rx = re.compile(os.environ["MT_PATTERN"].encode(), re.IGNORECASE)
@@ -184,14 +352,30 @@ return b"\n".join(l for l in message.split(b"\n") if not _rx.search(l))
 }
 
 _force_push() {
-    local b lease
-    while IFS= read -r b; do
-        [[ -z "$b" ]] && continue
+    # Only the branches that existed before the rewrite (Kamino item 171).
+    local ref b lease
+    while read -r _ ref; do
+        [[ -z "$ref" ]] && continue
+        b="${ref#refs/heads/}"
         lease=$(printf '%s\n' "$ORIGIN_REFS" | awk -v r="refs/remotes/origin/$b" '$2 == r { print $1 }')
         [[ -n "$lease" ]] || { info "skip $b (no origin branch)"; continue; }
-        if _git push --force-with-lease="refs/heads/$b:$lease" origin "$b" >&2; then success "force-pushed $b"; else warn "push failed: $b (remote moved? fetch, re-run)"; fi
-    done < <(_git for-each-ref --format='%(refname:short)' refs/heads)
-    if _git push --force origin --tags >&2; then success "force-pushed tags"; else warn "push failed: tags"; fi
+        if _git push --force-with-lease="$ref:$lease" origin "$ref:$ref" >&2; then success "force-pushed $b"; else warn "push failed: $b (remote moved? fetch, re-run)"; fi
+    done <<< "$HEADS_BEFORE"
+    # Tags: only those the rewrite changed, and only where origin has the tag
+    # as it was here before, leased on that sha (Kamino item 194). A blind
+    # `push --force --tags` overwrote origin's same-named tags and published
+    # local-only ones.
+    local before t now remote
+    while read -r before ref; do
+        [[ -z "$ref" ]] && continue
+        t="${ref#refs/tags/}"
+        now=$(_git rev-parse -q --verify "$ref") || { warn "skip tag $t (gone after the rewrite)"; continue; }
+        [[ "$now" != "$before" ]] || continue
+        remote=$(printf '%s\n' "$REMOTE_TAGS" | awk -v r="$ref" '$2 == r { print $1 }')
+        [[ -n "$remote" ]] || { info "skip tag $t (not on origin)"; continue; }
+        [[ "$remote" == "$before" ]] || { warn "skip tag $t (origin's is a different one; left alone)"; continue; }
+        if _git push --force-with-lease="$ref:$remote" origin "$ref:$ref" >&2; then success "force-pushed tag $t"; else warn "push failed: tag $t (remote moved? fetch, re-run)"; fi
+    done <<< "$TAGS_BEFORE"
     warn "GitHub keeps merged-PR commits via refs/pull/* — those pages still show old commits; the Contributors graph clears on recompute."
 }
 
@@ -226,6 +410,15 @@ _preflight() {
     _git rev-parse --is-inside-work-tree &>/dev/null || error_exit "Not a git repository: $REPO"
     [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — rewriting would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
     [[ -z "$(_git status --porcelain)" ]] || error_exit "Working tree not clean in $REPO — commit/stash first."
+    # A stopped rebase or a bisect has a clean tree (so has a cherry-pick of
+    # a range once a conflict is committed: only sequencer/ is left); rewriting
+    # under one strands it on commits that no longer exist.
+    local f p
+    for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD sequencer BISECT_START BISECT_LOG; do
+        p=$(_git rev-parse --git-path "$f")
+        [[ "$p" == /* ]] || p="$REPO/$p"
+        [[ ! -e "$p" ]] || error_exit "A rebase, merge, cherry-pick, revert or bisect is in progress in $REPO ($f) — finish or abort it first."
+    done
 }
 
 # _need_engine — stop here if this machine cannot rewrite history.
@@ -282,8 +475,10 @@ _setup() {
 
 main() {
     while [[ $# -gt 0 ]]; do case "$1" in
-        --repo) REPO="$2"; shift 2 ;;
-        --pattern) PATTERN="$2"; shift 2 ;;
+        --repo|--pattern)
+            [[ $# -ge 2 && -n "$2" ]] || { usage; error_exit "$1 needs a value."; }
+            if [[ "$1" == --repo ]]; then REPO="$2"; else PATTERN="$2"; fi
+            shift 2 ;;
         --apply) APPLY=true; shift ;;
         --push) PUSH=true; shift ;;
         --setup) _setup; exit 0 ;;
@@ -293,8 +488,13 @@ main() {
     REPO="${REPO/#\~/$HOME}"
 
     _preflight
+    # An explicit template: macOS's bare mktemp ignores TMPDIR.
+    WORK="$(mktemp -d "${TMPDIR:-/tmp}/mind-trick.XXXXXX")"; trap 'rm -rf "$WORK"' EXIT
+    [[ "$PUSH" != true ]] || _fetch_origin
     _report || exit 0
     _need_engine
+    _check_dialects
+    [[ "$PUSH" != true ]] || _check_push_safe
     if [[ "$APPLY" != true ]]; then
         info "Dry run — re-run with --apply to rewrite (and --push to force-push)."
         exit 0
@@ -303,7 +503,7 @@ main() {
     _rewrite
     success "History cleaned locally."
     if [[ "$PUSH" == true ]]; then _force_push
-    else info "Not pushed. Use --push, or: cd $REPO && git push --force origin <branch> --tags"; fi
+    else info "Not pushed. --apply --push together first checks that origin has nothing you lack; by hand, only if you pulled before --apply: cd $REPO && git push --force-with-lease origin <branch>"; fi
 }
 
 main "$@"
