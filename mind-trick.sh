@@ -130,7 +130,10 @@ _report() {
     local n; n=$(wc -l < "$WORK/all.commits" | tr -d ' ')
     if [[ "$n" -eq 0 ]]; then success "No commits match /$PATTERN/ — nothing to do."; return 1; fi
     warn "${n} commit(s) contain a line matching /$PATTERN/:"
-    _git log --no-walk --stdin -n 20 --format='  %h %an | %s' < "$WORK/all.commits" >&2   # -n, not | head: no SIGPIPE under pipefail
+    # Not -n 20: with it, git (2.39 and 2.43 at least) walks despite
+    # --no-walk, and the list showed the matching commits' ancestors too.
+    # awk, not head: it reads to the end, so no SIGPIPE under pipefail.
+    _git log --no-walk --stdin --format='  %h %an | %s' < "$WORK/all.commits" | awk 'NR <= 20' >&2
     (( n > 20 )) && info "  … and $((n - 20)) more"
     info "Affected branches:"
     local b hits

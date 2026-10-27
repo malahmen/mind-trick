@@ -103,6 +103,7 @@ before_sha="$(git -C "$T/a" rev-parse master)"
 out="$(bash "$MT" --repo "$T/a" 2>&1)"
 check "it reports the matching commits"   bash -c "printf '%s' \"\$1\" | grep -q '3 commit(s) contain'" _ "$out"
 check "it names the engine"               bash -c "printf '%s' \"\$1\" | grep -q 'Rewrite engine:'" _ "$out"
+check "it lists those 3 and no other"     bash -c "[ \"\$(printf '%s\n' \"\$1\" | grep -cE '^  [0-9a-f]{7,} t \| ')\" = 3 ] && ! printf '%s' \"\$1\" | grep -q '| change 2\$'" _ "$out"
 check "nothing was rewritten"             [ "$(git -C "$T/a" rev-parse master)" = "$before_sha" ]
 check "no backup was written"             bash -c "[ ! -d '$T/cache/mind-trick' ] || [ -z \"\$(ls -A '$T/cache/mind-trick')\" ]"
 
