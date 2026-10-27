@@ -34,7 +34,9 @@ APPLY=false
 PUSH=false
 BACKUP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mind-trick"
 ORIGIN_REFS=""                     # '<sha> refs/remotes/origin/<b>' lines as _check_push_safe checked them: the leases
+REMOTE_TAGS=""                     # '<sha> refs/tags/<t>' lines origin had before the rewrite (ls-remote)
 HEADS_BEFORE=""                    # '<sha> refs/heads/<b>' lines before the rewrite: the only branches ever pushed
+TAGS_BEFORE=""                     # '<sha> refs/tags/<t>' lines before the rewrite
 ENGINE=""                          # which rewriting tool _need_engine found
 WORK=""                            # scratch dir for the message dumps, removed on exit
 BUNDLE=""                          # the backup _backup wrote
@@ -92,11 +94,13 @@ bundle backup first. It cannot remove commits GitHub keeps in refs/pull/*
 Rewrites every local ref (branches, tags, origin/* tracking refs). --push first
 fetches origin and refuses the whole run (nothing rewritten, nothing pushed) if a
 local branch lacks commits its origin/<branch> has: pull first. It then sends
-the local branches that existed before the rewrite and exist on origin, plus
-tags; other remotes and remote-only branches are untouched. Nothing is pushed
-unless the rewritten history has no matching line left and lost only matching
-lines. Signatures on rewritten commits are dropped. Refuses a
-dirty tree (untracked files count) and shallow clones.
+the local branches that existed before the rewrite and exist on origin, and
+the tags the rewrite changed that origin has as they were here, each with a
+lease; other remotes, remote-only branches, local-only tags and tags origin
+has differently are untouched. Nothing is pushed unless the rewritten history
+has no matching line left and lost only matching lines. Signatures on
+rewritten commits are dropped. Refuses a dirty tree (untracked files count), a
+shallow clone, and a rebase, merge, cherry-pick, revert or bisect in progress.
 EOF
 }
 
@@ -176,10 +180,14 @@ with open(sys.argv[1], "rb") as f:
 
 # _fetch_origin — what origin has NOW, before anything is decided about it.
 # Branches only (--no-tags): a fetched tag must not clobber a local one.
+# origin's tags are listed instead: each tag push is leased on them.
 _fetch_origin() {
     _git remote get-url origin &>/dev/null || error_exit "--push needs a remote named 'origin' — nothing changed."
     info "Fetching origin…"
     _git fetch --no-tags --quiet origin >&2 || error_exit "Cannot fetch origin, so cannot check what --push would overwrite — nothing changed."
+    local tags
+    tags=$(_git ls-remote --tags origin) || error_exit "Cannot list origin's tags — nothing changed."
+    REMOTE_TAGS=$(printf '%s\n' "$tags" | awk '$2 !~ /\^\{\}$/')
 }
 
 # _check_push_safe — refuse unless every branch --push would send contains
@@ -230,6 +238,7 @@ _rewrite() {
     # the only ones ever pushed, and the messages are what the result is
     # checked against.
     HEADS_BEFORE=$(_git for-each-ref --format='%(objectname) %(refname)' refs/heads)
+    TAGS_BEFORE=$(_git for-each-ref --format='%(objectname) %(refname)' refs/tags)
     _messages "$WORK/before" --branches --tags
     local commits_before; commits_before=$(_git rev-list --count --branches --tags)
 
@@ -286,7 +295,7 @@ _verify_rewrite() {
 }
 
 _rewrite_filter_branch() {
-    local helper esc; helper=$(mktemp)
+    local helper="$WORK/msg-filter.sh" esc
     # The report's own grep, by path (single-quote-safe); the pattern comes
     # through the environment, not the filter's source.
     esc=$(printf '%s' "$GREP" | sed "s/'/'\\\\''/g")
@@ -297,10 +306,13 @@ msg="\$(cat)"
 msg="\$(printf '%s\n' "\$msg" | '${esc}' -v -i -E -e "\$MT_PATTERN" || true)"
 printf '%s\n' "\$msg"
 EOF
-    MT_PATTERN="$PATTERN" FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash '$helper'" --tag-name-filter cat -- --all >&2
-    local rc=$?
+    # In an `if`: under set -e a bare failing command ended the script right
+    # here, leaving the helper behind and saying nothing about the push.
+    if ! MT_PATTERN="$PATTERN" FILTER_BRANCH_SQUELCH_WARNING=1 _git filter-branch -f --msg-filter "bash $(printf '%q' "$helper")" --tag-name-filter cat -- --all >&2; then
+        rm -f "$helper"
+        error_exit "filter-branch failed — nothing pushed. If the repository looks wrong, restore it from the backup: git clone ${BUNDLE}"
+    fi
     rm -f "$helper"
-    [[ $rc -eq 0 ]] || error_exit "filter-branch failed — nothing pushed."
 }
 
 _rewrite_filter_repo() {
@@ -349,7 +361,21 @@ _force_push() {
         [[ -n "$lease" ]] || { info "skip $b (no origin branch)"; continue; }
         if _git push --force-with-lease="$ref:$lease" origin "$ref:$ref" >&2; then success "force-pushed $b"; else warn "push failed: $b (remote moved? fetch, re-run)"; fi
     done <<< "$HEADS_BEFORE"
-    if _git push --force origin --tags >&2; then success "force-pushed tags"; else warn "push failed: tags"; fi
+    # Tags: only those the rewrite changed, and only where origin has the tag
+    # as it was here before, leased on that sha (Kamino item 194). A blind
+    # `push --force --tags` overwrote origin's same-named tags and published
+    # local-only ones.
+    local before t now remote
+    while read -r before ref; do
+        [[ -z "$ref" ]] && continue
+        t="${ref#refs/tags/}"
+        now=$(_git rev-parse -q --verify "$ref") || { warn "skip tag $t (gone after the rewrite)"; continue; }
+        [[ "$now" != "$before" ]] || continue
+        remote=$(printf '%s\n' "$REMOTE_TAGS" | awk -v r="$ref" '$2 == r { print $1 }')
+        [[ -n "$remote" ]] || { info "skip tag $t (not on origin)"; continue; }
+        [[ "$remote" == "$before" ]] || { warn "skip tag $t (origin's is a different one; left alone)"; continue; }
+        if _git push --force-with-lease="$ref:$remote" origin "$ref:$ref" >&2; then success "force-pushed tag $t"; else warn "push failed: tag $t (remote moved? fetch, re-run)"; fi
+    done <<< "$TAGS_BEFORE"
     warn "GitHub keeps merged-PR commits via refs/pull/* — those pages still show old commits; the Contributors graph clears on recompute."
 }
 
@@ -384,6 +410,15 @@ _preflight() {
     _git rev-parse --is-inside-work-tree &>/dev/null || error_exit "Not a git repository: $REPO"
     [[ "$(_git rev-parse --is-shallow-repository)" != true ]] || error_exit "Shallow clone in $REPO — rewriting would produce broken history. Run: git fetch --unshallow (or re-clone without --depth)."
     [[ -z "$(_git status --porcelain)" ]] || error_exit "Working tree not clean in $REPO — commit/stash first."
+    # A stopped rebase or a bisect has a clean tree (so has a cherry-pick of
+    # a range once a conflict is committed: only sequencer/ is left); rewriting
+    # under one strands it on commits that no longer exist.
+    local f p
+    for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD sequencer BISECT_START BISECT_LOG; do
+        p=$(_git rev-parse --git-path "$f")
+        [[ "$p" == /* ]] || p="$REPO/$p"
+        [[ ! -e "$p" ]] || error_exit "A rebase, merge, cherry-pick, revert or bisect is in progress in $REPO ($f) — finish or abort it first."
+    done
 }
 
 # _need_engine — stop here if this machine cannot rewrite history.
@@ -440,8 +475,10 @@ _setup() {
 
 main() {
     while [[ $# -gt 0 ]]; do case "$1" in
-        --repo) REPO="$2"; shift 2 ;;
-        --pattern) PATTERN="$2"; shift 2 ;;
+        --repo|--pattern)
+            [[ $# -ge 2 && -n "$2" ]] || { usage; error_exit "$1 needs a value."; }
+            if [[ "$1" == --repo ]]; then REPO="$2"; else PATTERN="$2"; fi
+            shift 2 ;;
         --apply) APPLY=true; shift ;;
         --push) PUSH=true; shift ;;
         --setup) _setup; exit 0 ;;
@@ -451,7 +488,8 @@ main() {
     REPO="${REPO/#\~/$HOME}"
 
     _preflight
-    WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+    # An explicit template: macOS's bare mktemp ignores TMPDIR.
+    WORK="$(mktemp -d "${TMPDIR:-/tmp}/mind-trick.XXXXXX")"; trap 'rm -rf "$WORK"' EXIT
     [[ "$PUSH" != true ]] || _fetch_origin
     _report || exit 0
     _need_engine

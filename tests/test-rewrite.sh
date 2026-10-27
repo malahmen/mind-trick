@@ -239,6 +239,158 @@ check "it names what went wrong"             has "lines that do not match"
 check "it says nothing was pushed"           has "NOTHING was pushed"
 check "it says how to restore"               has "git clone .*\\.bundle"
 check "origin is untouched"                  [ "$(git -C "$w-origin.git" rev-parse master)" = "$r_before" ]
+
+echo "## 13. [$E] matching is case-insensitive, as grep -iE (Kamino 194)"
+w="$T/n-$E"; fixture "$w"
+git -C "$w" commit -q --allow-empty -m "lower" -m "co-authored-by: CLAUDE <noreply@anthropic.com>"
+git -C "$w" push -q origin master
+mt "$E" --repo "$w" --apply --push
+check "the report counts it"                 has "4 commit(s) contain"
+check "it is gone locally"                   bash -c "! git -C '$w' log --format=%B master | grep -qi 'co-authored-by: claude'"
+check "and on origin"                        bash -c "! git -C '$w-origin.git' log --format=%B master | grep -qi 'co-authored-by: claude'"
+
+echo "## 14. [$E] a branch origin does not have is scrubbed here, not pushed (Kamino 194)"
+w="$T/o-$E"; fixture "$w"
+git -C "$w" checkout -q -b wip
+git -C "$w" commit -q --allow-empty -m "local work" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
+git -C "$w" checkout -q master
+mt "$E" --repo "$w" --apply --push
+check "it says it skips wip"                 has "skip wip (no origin branch)"
+check "origin has no wip"                    bash -c "! git -C '$w-origin.git' rev-parse -q --verify refs/heads/wip >/dev/null"
+check "the local wip was scrubbed"           [ "$(trailers "$w" wip)" = 0 ]
+
+echo "## 15. [$E] tags: rewritten ones pushed with a lease, no others (Kamino 194)"
+# v1 (annotated) and v0 are on origin as here: pushed. mine is local-only:
+# not published. theirs is a different tag on origin: not overwritten.
+w="$T/q-$E"; fixture "$w"
+git -C "$w" tag -a v1 -m "release 1" master~1
+git -C "$w" tag v0 master~3
+git -C "$w" tag theirs master~2
+git -C "$w" push -q origin v1 v0
+git clone -q "$w-origin.git" "$w-mate"
+git -C "$w-mate" checkout -q --detach
+git -C "$w-mate" commit -q --allow-empty -m "their tagged commit"
+git -C "$w-mate" tag theirs
+git -C "$w-mate" push -q origin theirs
+git -C "$w" tag mine master
+theirs_before="$(git -C "$w-origin.git" rev-parse refs/tags/theirs)"
+v1_before="$(git -C "$w-origin.git" rev-parse refs/tags/v1)"
+mt "$E" --repo "$w" --apply --push
+check "it succeeds"                          [ "$rc" -eq 0 ]
+check "origin's v1 moved"                    [ "$(git -C "$w-origin.git" rev-parse refs/tags/v1)" != "$v1_before" ]
+check "origin's v1 is still annotated"       [ "$(git -C "$w-origin.git" cat-file -t refs/tags/v1)" = tag ]
+check "origin's v1 and v0 point at scrubbed history" bash -c "[ \"\$(git -C \"\$1\" log --format='%(trailers:key=Co-Authored-By)' v1 v0 | grep -c .)\" = 0 ]" _ "$w-origin.git"
+check "origin's v1 is what is here"          [ "$(git -C "$w-origin.git" rev-parse 'v1^{commit}')" = "$(git -C "$w" rev-parse 'v1^{commit}')" ]
+check "the local-only tag was not published" bash -c "! git -C '$w-origin.git' rev-parse -q --verify refs/tags/mine >/dev/null"
+check "origin's own theirs is untouched"     [ "$(git -C "$w-origin.git" rev-parse refs/tags/theirs)" = "$theirs_before" ]
+check "it says so"                           has "skip tag theirs (origin's is a different one"
+check "and why mine was not pushed"          has "skip tag mine (not on origin)"
+
+echo "## 15b. [$E] a tag that moved on origin after the listing is refused, not overwritten (Kamino 194)"
+# The teammate re-tags v1 between mind-trick's ls-remote and its tag push:
+# only the lease can stop it.
+w="$T/q2-$E"; fixture "$w"
+git -C "$w" tag v1 master~1
+git -C "$w" push -q origin v1
+git clone -q "$w-origin.git" "$w-mate"
+git -C "$w-mate" commit -q --allow-empty -m "their v1"
+mkdir -p "$w-race"
+cat > "$w-race/git" <<RACE
+#!/bin/sh
+[ "\$1" = filter-repo ] && [ "$E" = filter-branch ] && { echo "git: 'filter-repo' is not a git command." >&2; exit 1; }
+if [ "\$3" = push ] && [ ! -e "$w-race/done" ]; then
+    case "\$*" in *refs/tags/v1*)
+        : > "$w-race/done"; "$REAL_GIT" -C "$w-mate" tag -f v1 >/dev/null; "$REAL_GIT" -C "$w-mate" push -q -f origin v1 ;;
+    esac
+fi
+exec "$REAL_GIT" "\$@"
+RACE
+chmod +x "$w-race/git"
+out="$(PATH="$w-race:$PATH" bash "$MT" --repo "$w" --apply --push 2>&1)"; rc=$?
+check "it ran with $E"                       has "Rewrite engine: $E"
+check "the race fired"                       [ -e "$w-race/done" ]
+check "origin's v1 is the teammate's"        [ "$(git -C "$w-origin.git" rev-parse v1)" = "$(git -C "$w-mate" rev-parse v1)" ]
+check "it says the tag push failed"          has "push failed: tag v1"
+
+echo "## 16. [$E] the old commits are gone from the repository, reflogs too (Kamino 194)"
+w="$T/r-$E"; fixture "$w"
+old="$(git -C "$w" rev-parse master)"
+mt "$E" --repo "$w" --apply
+check "it succeeds"                          [ "$rc" -eq 0 ]
+check "the pre-rewrite tip is not in the object store" bash -c "! git -C '$w' cat-file -e '$old' 2>/dev/null"
+check "no reflog still names it"             bash -c "! git -C '$w' reflog --all --format=%H 2>/dev/null | grep -q '$old'"
+
+if [ "$E" = filter-branch ]; then
+echo "## 17. [$E] filter-branch fails: helper removed, 'nothing pushed', origin untouched (Kamino 194)"
+# Under set -e the failure ended the script before its own check.
+w="$T/s-$E"; fixture "$w"; mkdir -p "$w-fail" "$w-tmp"
+cat > "$w-fail/git" <<FAIL
+#!/bin/sh
+[ "\$1" = filter-repo ] && { echo "git: 'filter-repo' is not a git command." >&2; exit 1; }
+[ "\$3" = filter-branch ] && { echo "fatal: simulated filter-branch failure" >&2; exit 1; }
+exec "$REAL_GIT" "\$@"
+FAIL
+chmod +x "$w-fail/git"
+m_before="$(git -C "$w" rev-parse master)"; r_before="$(git -C "$w-origin.git" rev-parse master)"
+out="$(PATH="$w-fail:$PATH" TMPDIR="$w-tmp" bash "$MT" --repo "$w" --apply --push 2>&1)"; rc=$?
+check "it fails"                             [ "$rc" -ne 0 ]
+check "it says nothing was pushed"           has "filter-branch failed — nothing pushed"
+check "its helper file is gone"              bash -c "[ -z \"\$(ls -A '$w-tmp')\" ]"
+check "master is untouched"                  [ "$(git -C "$w" rev-parse master)" = "$m_before" ]
+check "origin is untouched"                  [ "$(git -C "$w-origin.git" rev-parse master)" = "$r_before" ]
+fi
+done
+
+E="${ENGINES[0]:-}"
+if [ -n "$E" ]; then
+echo "## 18. refusals before anything is written: shallow, dirty, an operation in progress (Kamino 194)"
+fixture "$T/u"
+git clone -q --depth 1 "file://$T/u-origin.git" "$T/u-shallow"
+sha="$(git -C "$T/u-shallow" rev-parse HEAD)"
+mt "$E" --repo "$T/u-shallow" --apply
+check "a shallow clone is refused"           bash -c "[ $rc -ne 0 ] && printf '%s' \"\$1\" | grep -q 'Shallow clone'" _ "$out"
+check "and left as it was"                   [ "$(git -C "$T/u-shallow" rev-parse HEAD)" = "$sha" ]
+sha="$(git -C "$T/u" rev-parse master)"
+echo scratch > "$T/u/untracked.txt"
+mt "$E" --repo "$T/u" --apply
+check "an untracked file is refused"         bash -c "[ $rc -ne 0 ] && printf '%s' \"\$1\" | grep -q 'not clean'" _ "$out"
+check "and master left as it was"            [ "$(git -C "$T/u" rev-parse master)" = "$sha" ]
+rm -f "$T/u/untracked.txt"
+GIT_SEQUENCE_EDITOR="sed -i.bak -e 's/^pick/edit/'" git -C "$T/u" rebase -q -i master~2 >/dev/null 2>&1
+check "(a rebase is stopped, tree clean)"    bash -c "[ -d '$T/u/.git/rebase-merge' ] && [ -z \"\$(git -C '$T/u' status --porcelain)\" ]"
+head_before="$(git -C "$T/u" rev-parse HEAD)"
+mt "$E" --repo "$T/u" --apply
+check "a rebase in progress is refused"      bash -c "[ $rc -ne 0 ] && printf '%s' \"\$1\" | grep -q 'in progress'" _ "$out"
+check "and nothing was rewritten"            bash -c "[ \"\$(git -C '$T/u' rev-parse master)\" = '$sha' ] && [ \"\$(git -C '$T/u' rev-parse HEAD)\" = '$head_before' ]"
+git -C "$T/u" rebase --abort
+git -C "$T/u" bisect start >/dev/null 2>&1
+mt "$E" --repo "$T/u" --apply
+check "a bisect in progress is refused"      bash -c "[ $rc -ne 0 ] && printf '%s' \"\$1\" | grep -q 'in progress'" _ "$out"
+check "and master left as it was"            [ "$(git -C "$T/u" rev-parse master)" = "$sha" ]
+git -C "$T/u" bisect reset >/dev/null 2>&1
+# A range cherry-pick stopped on a conflict, resolved and committed: the tree
+# is clean and only .git/sequencer says the pick is not finished.
+git -C "$T/u" checkout -q -b pick master~1
+echo "their line" >> "$T/u/file.txt"; git -C "$T/u" commit -q -am "pick one"
+echo x > "$T/u/other.txt"; git -C "$T/u" add other.txt; git -C "$T/u" commit -q -m "pick two"
+git -C "$T/u" checkout -q master
+git -C "$T/u" cherry-pick master..pick >/dev/null 2>&1
+git -C "$T/u" checkout -q --theirs file.txt; git -C "$T/u" add file.txt
+git -C "$T/u" -c core.editor=true commit -q --no-edit >/dev/null 2>&1
+check "(only a stopped cherry-pick, tree clean)" bash -c "[ -d '$T/u/.git/sequencer' ] && [ -z \"\$(cd '$T/u/.git' && ls -d rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_START BISECT_LOG 2>/dev/null)\" ] && [ -z \"\$(git -C '$T/u' status --porcelain)\" ]"
+head_before="$(git -C "$T/u" rev-parse HEAD)"
+mt "$E" --repo "$T/u" --apply
+check "a cherry-pick in progress is refused" bash -c "[ $rc -ne 0 ] && printf '%s' \"\$1\" | grep -q 'in progress'" _ "$out"
+check "and nothing was rewritten"            [ "$(git -C "$T/u" rev-parse HEAD)" = "$head_before" ]
+git -C "$T/u" cherry-pick --abort >/dev/null 2>&1
+fi
+
+echo "## 19. a flag missing its value is a usage error (Kamino 194)"
+for f in --repo --pattern; do
+    out="$(bash "$MT" "$f" 2>&1)"; rc=$?
+    check "$f alone: exit 1"                 [ "$rc" -eq 1 ]
+    check "$f alone: says it needs a value"  has "$f needs a value"
+    check "$f alone: no 'unbound variable'"  bash -c "! printf '%s' \"\$1\" | grep -q unbound" _ "$out"
 done
 
 echo "## 4. no engine: refuse before the backup"

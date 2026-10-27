@@ -22,8 +22,10 @@ History rewriting is destructive, so mind-trick is conservative:
   match; nothing changes.
 - **Backup first** — `--apply` always writes a `git bundle` of the whole repo to
   `~/.cache/mind-trick/` before rewriting (restore: `git clone <bundle>`).
-- **Refuses a dirty working tree** (untracked files count as dirty) and non-git
-  directories.
+- **Refuses a dirty working tree** (untracked files count as dirty), non-git
+  directories, and a rebase, merge, cherry-pick, revert or bisect in progress
+  (a stopped rebase or a bisect leaves the tree clean, and rewriting under it
+  strands the operation on commits that no longer exist).
 - **Refuses shallow clones** (`--depth`) — neither rewrite engine can produce
   sound history from a truncated one. Run `git fetch --unshallow` first, or
   re-clone in full.
@@ -36,7 +38,10 @@ History rewriting is destructive, so mind-trick is conservative:
   bring every scrubbed commit back beside its rewritten twin.
 - Branches are then pushed with `--force-with-lease` against the sha that check
   saw, so a push that lands on `origin` after it is rejected instead of
-  clobbered; tags are pushed with `--force`.
+  clobbered. Tags likewise: only a tag the rewrite changed, and only where
+  `origin` has that tag as it was here before the rewrite, leased on that sha.
+  A tag `origin` has differently is left alone (with a warning), and a
+  local-only tag is not published.
 - **What is shown is what is rewritten.** The report reads every message line
   with `grep -iE`, and filter-branch's filter runs that same `grep`. filter-repo
   rewrites with Python's `re`, a different dialect, so before anything is done
@@ -57,9 +62,10 @@ History rewriting is destructive, so mind-trick is conservative:
   `origin/*` remote-tracking refs.
 - **Pushed with `--push`:** every local branch that existed before the rewrite
   and has an `origin/<branch>` counterpart (branches without one are skipped
-  with a note), then all tags.
-- **Untouched:** other remotes, and branches that exist only on the remote (no
-  local branch) — check them out first if they need scrubbing. filter-repo
+  with a note), then the rewritten tags `origin` has as they were here.
+- **Untouched:** other remotes, local-only tags, tags `origin` has
+  differently, and branches that exist only on the remote (no local branch) —
+  check them out first if they need scrubbing. filter-repo
   turns `origin/<branch>` into a local branch when none exists; mind-trick
   deletes those again, so with either engine they are neither pushed nor left
   behind.
